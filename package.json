@@ -1,0 +1,21 @@
+{
+	"name": "superhive-pi-truth",
+	"private": true,
+	"version": "0.1.0",
+	"description": "Single source of truth for all Pi agent configuration. After first launch, manifest.json is dormant; this extension owns the Superhive-pi-{foldername}.json file as the live, watcher-driven control surface for Superhive and any external tool.",
+	"type": "module",
+	"exports": {
+		"./settings-schema": "./settings-schema.ts",
+		"./package.json": "./package.json"
+	},
+	"scripts": {
+		"clean": "echo 'nothing to clean'",
+		"build": "echo 'nothing to build'",
+		"check": "echo 'nothing to check'"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	}
+}
