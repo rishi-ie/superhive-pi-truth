@@ -68,10 +68,21 @@ function buildInitialSettings(ctx: ExtensionContext): SettingsFile {
 	// already been applied via --manifest in cli.ts; this file is the
 	// snapshot of "what is currently active" plus the catalog and sessions
 	// index the agent will fill in.
+	//
+	// Pin both extensions into the active manifest so Pi's loadExtensions
+	// takes the deterministic "explicit paths" branch instead of relying
+	// on directory auto-discovery — the latter silently drops one of two
+	// symlinked extensions in some Pi builds on macOS. We reach into
+	// the settings file because truth owns the manifest lifecycle; cli.ts
+	// reads `manifest.extensions` from this file at every boot.
 	const settings: SettingsFile = {
 		...DEFAULT_SETTINGS,
 		managedBy: MANAGED_BY,
 		lastModified: new Date().toISOString(),
+		extensions: [
+			"./extensions/superhive-pi-truth",
+			"./extensions/superhive-pi-telemetry",
+		],
 	};
 	return settings;
 }
@@ -115,6 +126,46 @@ async function runExtension(pi: ExtensionAPI, ctx: ExtensionContext): Promise<vo
 		notify("First run: seeding settings file", "info");
 		const initial = buildInitialSettings(ctx);
 		writeSettings(state.settingsFilePath, initial);
+	}
+
+	// 1a. Backfill: existing settings files created before this commit
+	// may have an empty `extensions` block. We need both truth and
+	// telemetry in the active manifest so Pi's loadExtensions takes the
+	// explicit paths branch; without this, only directory auto-discovery
+	// runs and one of the two symlinked extensions is silently dropped
+	// on some Pi/macOS combinations.
+	const REQUIRED_EXTENSIONS = [
+		"./extensions/superhive-pi-truth",
+		"./extensions/superhive-pi-telemetry",
+	] as const;
+	{
+		let loaded: SettingsFile | null = null;
+		try {
+			loaded = readSettings(state.settingsFilePath);
+		} catch {
+			loaded = null;
+		}
+		const have = Array.isArray(loaded?.extensions) ? loaded!.extensions : [];
+		const missing = REQUIRED_EXTENSIONS.filter((e) => !have.includes(e));
+		if (missing.length > 0 && loaded) {
+			const next: SettingsFile = {
+				...loaded,
+				extensions: [...have, ...missing],
+				lastModified: new Date().toISOString(),
+			};
+			try {
+				writeSettings(state.settingsFilePath, next);
+				notify(
+					`Backfilled extensions in settings file (added: ${missing.join(", ")})`,
+					"info",
+				);
+			} catch (err) {
+				notify(
+					`Failed to backfill extensions: ${(err as Error).message}`,
+					"warning",
+				);
+			}
+		}
 	}
 
 	// 2. Load + validate.
