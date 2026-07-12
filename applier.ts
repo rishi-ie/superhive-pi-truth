@@ -30,6 +30,26 @@ const TERMINAL_TOOLS = ["bash"];
 
 const API_KEY_PATTERN = /_API_KEY$/;
 
+/**
+ * Operator-curated fallback context windows for providers whose models
+ * Pi's bundled registry does not list. Keys are lowercased provider
+ * names; values map model-id → contextWindow.
+ *
+ * Why this exists: setModel({...}) without a contextWindow field lets
+ * Pi use its internal default (200K), which is wrong for several
+ * real providers. The registry is the source of truth when it has an
+ * entry; this table is the source of truth when it doesn't. UI
+ * surfaces in `src/pages/settings/sections/ModelsSection/ModelEntry.
+ * contextWindow?` keep user overrides authoritative for providers
+ * already in the registry.
+ */
+export const HARDCODED_CONTEXT_WINDOWS: Record<string, Record<string, number>> = {
+	minimax: {
+		"MiniMax-M3": 1_000_000,
+		"MiniMax-M2.7": 1_000_000,
+	},
+};
+
 export interface ApplyResult {
 	/** True if any Tier 2 fields changed and a reload is required. */
 	needsReload: boolean;
@@ -253,13 +273,22 @@ async function applyModel(target: SettingsFile["model"], ctx: ApplyContext): Pro
 	// contextWindow / maxTokens: look up the live registry value via
 	// ctx.resolveContextWindow. When the registry has no entry for this
 	// provider+model (e.g. a fully custom provider Pi doesn't ship with)
-	// we omit those fields entirely so Pi's runtime picks the value it
-	// considers natural for an unknown model — never an extension-side
-	// constant. Previously these were hardcoded 200000/16384, which
-	// masked the real window for any model whose registry entry differed.
+	// we consult HARDCODED_CONTEXT_WINDOWS, the operator-curated fallback
+	// table. Only if both are absent do we omit the field and let Pi pick
+	// its natural default. Previously these were hardcoded 200000/16384,
+	// which masked the real window for any model whose registry entry
+	// differed.
 	const resolvedWindow = ctx.resolveContextWindow
 		? await ctx.resolveContextWindow(target.provider, target.name)
 		: undefined;
+	const providerLc = target.provider.toLowerCase();
+	const fallbackWindow = HARDCODED_CONTEXT_WINDOWS[providerLc]?.[target.name];
+	const effectiveWindow =
+		typeof resolvedWindow === "number" && resolvedWindow > 0
+			? resolvedWindow
+			: typeof fallbackWindow === "number" && fallbackWindow > 0
+				? fallbackWindow
+				: undefined;
 	const model: Record<string, unknown> = {
 		id: target.name,
 		name: target.name,
@@ -270,8 +299,8 @@ async function applyModel(target: SettingsFile["model"], ctx: ApplyContext): Pro
 		input: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	};
-	if (typeof resolvedWindow === "number" && resolvedWindow > 0) {
-		model.contextWindow = resolvedWindow;
+	if (typeof effectiveWindow === "number") {
+		model.contextWindow = effectiveWindow;
 	}
 	// biome-ignore lint/suspicious/noExplicitAny: fields are optional/partial for type compat
 	return await ctx.pi.setModel(model as Model<any>);
