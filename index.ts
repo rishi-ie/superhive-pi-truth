@@ -82,6 +82,12 @@ async function runExtension(pi: ExtensionAPI, ctx: ExtensionContext): Promise<vo
 
 	const notify = makeNotifier(ctx);
 
+	// Surface the agent dir to peer extensions via env. The telemetry
+	// extension uses this as a fallback when ctx.cwd is empty.
+	const agentRoot = dirname(workspace);
+	process.env.AGENT_DIR = agentRoot;
+	process.env.PI_AGENT_DIR = agentRoot;
+
 	const resolveContextWindow = async (
 		provider: string,
 		name: string,
