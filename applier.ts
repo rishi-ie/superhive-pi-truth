@@ -45,6 +45,16 @@ export interface ApplyContext {
 	pi: ExtensionAPI;
 	hasUI: boolean;
 	notify(message: string, level?: "info" | "warning" | "error"): void;
+	/**
+	 * Look up the registry's contextWindow for a provider+model pair.
+	 * Returns undefined when the registry has no entry (e.g. a fully
+	 * custom provider Pi doesn't recognise). Callers should treat
+	 * undefined as "leave contextWindow off the setModel payload".
+	 */
+	resolveContextWindow?: (
+		provider: string,
+		name: string,
+	) => Promise<number | undefined>;
 }
 
 /**
@@ -239,21 +249,32 @@ async function applyModel(target: SettingsFile["model"], ctx: ApplyContext): Pro
 	// and call setModel with a typed Model object.
 	// The `api` field must match the provider's wire protocol — derive it
 	// from the provider name via the shared lookup table.
-	const model: Model<any> = {
+	//
+	// contextWindow / maxTokens: look up the live registry value via
+	// ctx.resolveContextWindow. When the registry has no entry for this
+	// provider+model (e.g. a fully custom provider Pi doesn't ship with)
+	// we omit those fields entirely so Pi's runtime picks the value it
+	// considers natural for an unknown model — never an extension-side
+	// constant. Previously these were hardcoded 200000/16384, which
+	// masked the real window for any model whose registry entry differed.
+	const resolvedWindow = ctx.resolveContextWindow
+		? await ctx.resolveContextWindow(target.provider, target.name)
+		: undefined;
+	const model: Record<string, unknown> = {
 		id: target.name,
 		name: target.name,
 		provider: target.provider,
-		// biome-ignore lint/suspicious/noExplicitAny: Model is generic over Api; we don't constrain here
-		api: apiForProvider(target.provider) as any,
+		api: apiForProvider(target.provider),
 		baseUrl: undefined,
 		reasoning: false,
 		input: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 200000,
-		maxTokens: 16384,
-		// biome-ignore lint/suspicious/noExplicitAny: fields are optional/partial for type compat
-	} as any;
-	return await ctx.pi.setModel(model);
+	};
+	if (typeof resolvedWindow === "number" && resolvedWindow > 0) {
+		model.contextWindow = resolvedWindow;
+	}
+	// biome-ignore lint/suspicious/noExplicitAny: fields are optional/partial for type compat
+	return await ctx.pi.setModel(model as Model<any>);
 }
 
 function permissionsChanged(a: SettingsFile["permissions"], b: SettingsFile["permissions"]): boolean {

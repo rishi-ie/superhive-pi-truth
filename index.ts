@@ -82,6 +82,28 @@ async function runExtension(pi: ExtensionAPI, ctx: ExtensionContext): Promise<vo
 
 	const notify = makeNotifier(ctx);
 
+	const resolveContextWindow = async (
+		provider: string,
+		name: string,
+	): Promise<number | undefined> => {
+		try {
+			const catalog = await ctx.modelRegistry?.getAvailable?.();
+			if (!catalog) return undefined;
+			const match = catalog.find(
+				(m) => m.provider === provider && m.id === name,
+			);
+			return match?.contextWindow;
+		} catch (err) {
+			notify(
+				`resolveContextWindow failed: ${(err as Error).message}`,
+				"warning",
+			);
+			return undefined;
+		}
+	};
+
+	const applyContext = { pi, hasUI: ctx.hasUI, notify, resolveContextWindow };
+
 	// 1. First-run migration: if the file doesn't exist, seed it.
 	if (!existsSync(state.settingsFilePath)) {
 		notify("First run: seeding settings file", "info");
@@ -130,7 +152,7 @@ async function runExtension(pi: ExtensionAPI, ctx: ExtensionContext): Promise<vo
 			};
 			try {
 				writeSettings(state.settingsFilePath, merged);
-				applySettingsDiff(current, merged, { pi, hasUI: ctx.hasUI, notify });
+				applySettingsDiff(current, merged, applyContext);
 				state.previousSettings = merged;
 				notify(
 					`Seeded ${Object.keys(envPatch).length} API key(s) from process.env into settings`,
@@ -150,7 +172,7 @@ async function runExtension(pi: ExtensionAPI, ctx: ExtensionContext): Promise<vo
 	//     first LLM request would have no provider auth and would fall
 	//     through to the env-var fallback. This makes the file's
 	//     `providers` block the source of truth from the very first turn.
-	applyInitialProviders(current.providers, { pi, hasUI: ctx.hasUI, notify });
+	applyInitialProviders(current.providers, applyContext);
 
 	// 4. Start watcher. On external change → re-read → diff → apply.
 	state.watcher = createWatcher(state.settingsFilePath, {
@@ -246,7 +268,7 @@ function handleWatcherChange(pi: ExtensionAPI, ctx: ExtensionContext, notify: (m
 	state.watcher?.markSelfWrite();
 
 	// Apply the diff to the running session.
-	applySettingsDiff(prev, next, { pi, hasUI: ctx.hasUI, notify }).then((result) => {
+	applySettingsDiff(prev, next, applyContext).then((result) => {
 		if (result.applied.length > 0) {
 			notify(`Applied: ${result.applied.join(", ")}`, "info");
 		}
