@@ -332,6 +332,17 @@ function handleWatcherChange(pi: ExtensionAPI, ctx: ExtensionContext, notify: (m
 		if (result.failed.length > 0) {
 			for (const f of result.failed) {
 				notify(`Failed: ${f.field} — ${f.reason}`, "warning");
+				// Also write to stderr so the main process picks it up
+				// in main.log. The in-Pi notify is only visible inside
+				// the agent, but the renderer needs the failure to
+				// surface during integration debugging.
+				try {
+					process.stderr.write(
+						`[superhive-pi-truth] apply failed: ${f.field} — ${f.reason}\n`,
+					);
+				} catch {
+					// ignore
+				}
 			}
 		}
 		if (result.needsReload) {
