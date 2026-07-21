@@ -165,6 +165,46 @@ export interface LastEvent {
 	timestamp: string;
 }
 
+/**
+ * A member agent reference as stored on the coordinator's `project` block.
+ * Mirrors the runtime Agent row but is a snapshot for the LLM context —
+ * `status` is kept fresh by Electron's status-mirror helper on
+ * start/stop/update_status transitions.
+ *
+ * `localPath` (Gap 2) lets the coordinator's `ask_member` tool resolve the
+ * recipient agent's directory to write `<memberDir>/inbox.jsonl` without an
+ * out-of-band index. Electron stamps it on member-add.
+ */
+export interface MemberRef {
+	agentId: string;
+	name: string;
+	role?: string;
+	model?: { provider: string; name: string };
+	status: "idle" | "active" | "error";
+	joinedAt: string;
+	localPath?: string;
+}
+
+/**
+ * Project block embedded in the coordinator's truth settings file.
+ * Only present when `agentKind === 'project-coordinator'`. The orchestration
+ * extension (`superhive-pi-orchestration`) reads this on `session_start` to
+ * build the CEO system prompt and to power the 5 coordinator-only tools.
+ *
+ * Gap 2: `localPath` lets worker agents' `post_to_project` tool find
+ * `<localPath>/agent/chat.jsonl` to append to the project chat. `coordinatorAgentId`
+ * was implicit before; now explicit so the orchestrator extension can detect
+ * role by comparison with `AGENT_ID`.
+ */
+export interface ProjectBlock {
+	id: string;
+	name: string;
+	description: string;
+	members: MemberRef[];
+	localPath?: string;
+	coordinatorAgentId?: string;
+}
+
 export interface SettingsFile {
 	version: 1;
 	managedBy?: string;
@@ -258,6 +298,11 @@ export interface SettingsFile {
 
 	// Last event (small ring buffer)
 	lastEvent?: LastEvent;
+
+	// Project metadata (coordinator-only). Written by Electron on coordinator
+	// creation; kept fresh by the status-mirror helper on member start/stop.
+	// Read by the orchestration extension's session_start handler.
+	project?: ProjectBlock;
 }
 
 // ---------------------------------------------------------------------------
