@@ -33,7 +33,8 @@ const API_KEY_PATTERN = /_API_KEY$/;
 /**
  * Operator-curated fallback context windows for providers whose models
  * Pi's bundled registry does not list. Keys are lowercased provider
- * names; values map model-id → contextWindow.
+ * names; model-id keys are also lowercased so settings-typed casing
+ * (e.g. "Minimax-M3") matches the registry's canonical form.
  *
  * Why this exists: setModel({...}) without a contextWindow field lets
  * Pi use its internal default (200K), which is wrong for several
@@ -45,8 +46,8 @@ const API_KEY_PATTERN = /_API_KEY$/;
  */
 export const HARDCODED_CONTEXT_WINDOWS: Record<string, Record<string, number>> = {
 	minimax: {
-		"MiniMax-M3": 1_000_000,
-		"MiniMax-M2.7": 1_000_000,
+		"minimax-m3": 1_000_000,
+		"minimax-m2.7": 1_000_000,
 	},
 };
 
@@ -262,7 +263,7 @@ function modelChanged(a: SettingsFile["model"], b: SettingsFile["model"], ctx: A
 	return false;
 }
 
-async function applyModel(target: SettingsFile["model"], ctx: ApplyContext): Promise<boolean> {
+export async function applyModel(target: SettingsFile["model"], ctx: ApplyContext): Promise<boolean> {
 	if (!target?.provider || !target.name) return false;
 	// Use the public ExtensionAPI to look up the model
 	// The model registry isn't directly exposed, so we use a well-known shape
@@ -282,7 +283,7 @@ async function applyModel(target: SettingsFile["model"], ctx: ApplyContext): Pro
 		? await ctx.resolveContextWindow(target.provider, target.name)
 		: undefined;
 	const providerLc = target.provider.toLowerCase();
-	const fallbackWindow = HARDCODED_CONTEXT_WINDOWS[providerLc]?.[target.name];
+	const fallbackWindow = HARDCODED_CONTEXT_WINDOWS[providerLc]?.[target.name.toLowerCase()];
 	const effectiveWindow =
 		typeof resolvedWindow === "number" && resolvedWindow > 0
 			? resolvedWindow

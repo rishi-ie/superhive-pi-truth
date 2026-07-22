@@ -22,8 +22,9 @@
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { applySettingsDiff, applyInitialProviders } from "./applier.ts";
+import { applySettingsDiff, applyInitialProviders, applyModel } from "./applier.ts";
 import { createCatalogScanner } from "./catalog-scanner.ts";
+import { clearChecklist } from "./checklist.ts";
 import { readSettings, writeSettings, writerCounter } from "./file-io.ts";
 import { createSessionsIndexer } from "./sessions-indexer.ts";
 import { DEFAULT_SETTINGS, type SettingsFile, settingsFilePathFor } from "./settings-schema.ts";
@@ -106,8 +107,18 @@ async function runExtension(pi: ExtensionAPI, ctx: ExtensionContext): Promise<vo
 		try {
 			const catalog = await ctx.modelRegistry?.getAvailable?.();
 			if (!catalog) return undefined;
+			// Case-insensitive on provider and id: settings files often carry
+			// display casing (e.g. "Minimax") that differs from Pi's registry
+			// keys (e.g. "minimax"). Without the lowercase, the lookup misses
+			// and applyModel falls through to a partial setModel payload that
+			// has no contextWindow field — which then surfaces the wrong cap
+			// (or none) in the ring.
+			const providerLc = provider.toLowerCase();
+			const nameLc = name.toLowerCase();
 			const match = catalog.find(
-				(m) => m.provider === provider && m.id === name,
+				(m) =>
+					m.provider.toLowerCase() === providerLc &&
+					m.id.toLowerCase() === nameLc,
 			);
 			return match?.contextWindow;
 		} catch (err) {
@@ -243,6 +254,23 @@ async function runExtension(pi: ExtensionAPI, ctx: ExtensionContext): Promise<vo
 	});
 	state.watcher.start();
 
+	// 4a. Force the session model onto whatever the settings file names.
+	// Pi's findInitialModel falls through to the provider default when its
+	// case-sensitive registry find misses (settings carry display casing
+	// like "Minimax" / "Minimax-M3" while the registry uses "minimax" /
+	// "MiniMax-M3"). Without this, the session comes up on M2.7 (the
+	// defaultModelPerProvider.minimax fallback) even though the file
+	// names M3, and the context ring stays at 204K. applyModel does its
+	// own case-insensitive lookup against ctx.modelRegistry.getAvailable()
+	// and HARDCODED_CONTEXT_WINDOWS, so it correctly resolves 1M here.
+	// Skipped silently when the file has no model selected yet.
+	if (state.settings?.model?.provider && state.settings.model.name) {
+		void applyModel(
+			{ provider: state.settings.model.provider, name: state.settings.model.name },
+			applyContext,
+		);
+	}
+
 	// 5. Initial catalog scan + sessions index.
 	const workspaceRoot = dirname(workspace);
 	const agentDir = join(workspaceRoot, ".pi", "agent");
@@ -359,6 +387,7 @@ function teardown(): void {
 	state.catalogScanner?.dispose();
 	state.catalogScanner = null;
 	state.previousSettings = null;
+	clearChecklist();
 	disposeState();
 }
 

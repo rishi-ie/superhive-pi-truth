@@ -15,6 +15,13 @@
 import { Type, type Static } from "typebox";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getSettings, getSettingsPath, setSettings } from "./state.ts";
+import {
+	clearChecklist,
+	emitChecklistToJournal,
+	getChecklist,
+	setChecklist,
+	type ChecklistItem,
+} from "./checklist.ts";
 import type { SettingsFile } from "./settings-schema.ts";
 
 export interface ToolsContext {
@@ -259,11 +266,51 @@ const toggleResourceTool = defineTool({
 });
 
 // ---------------------------------------------------------------------------
+// Tool 9: update_checklist
+// ---------------------------------------------------------------------------
+
+const UpdateChecklistParams = Type.Object({
+	taskName: Type.String({ description: "Short name of the task the agent is working on (e.g. 'Implement POST /orders')" }),
+	items: Type.Array(
+		Type.Object({
+			text: Type.String({ description: "One step in the plan" }),
+			done: Type.Boolean({ description: "True if the step is complete" }),
+		}),
+		{ description: "Ordered checklist rows" },
+	),
+});
+
+const updateChecklistTool = defineTool({
+	name: "update_checklist",
+	label: "Update Checklist",
+	description:
+		"Replace the agent's current task checklist. Call this whenever you start a new task (with all items `done: false`) or as you mark steps complete. The right sidebar's 'Active checklist' accordion mirrors these rows live.",
+	parameters: UpdateChecklistParams,
+
+	async execute(_id, params, _signal, _onUpdate, _ctx) {
+		const path = getSettingsPath();
+		const items: ChecklistItem[] = params.items.map((i) => ({
+			text: i.text,
+			done: i.done,
+		}));
+		setChecklist({ taskName: params.taskName, items });
+		emitChecklistToJournal(path, params.taskName, items);
+		return jsonResult({
+			ok: true,
+			taskName: params.taskName,
+			total: items.length,
+			done: items.filter((i) => i.done).length,
+			message: `Checklist updated: ${items.filter((i) => i.done).length}/${items.length} done`,
+		});
+	},
+});
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /**
- * Register all 8 tools with the extension API.
+ * Register all 9 tools with the extension API.
  */
 export function registerAllTools(pi: ExtensionAPI): void {
 	pi.registerTool(getCurrentSettingsTool);
@@ -274,7 +321,12 @@ export function registerAllTools(pi: ExtensionAPI): void {
 	pi.registerTool(getSessionStatsTool);
 	pi.registerTool(listCatalogTool);
 	pi.registerTool(toggleResourceTool);
+	pi.registerTool(updateChecklistTool);
 }
+
+// Exported for the session_shutdown teardown so the in-memory checklist
+// doesn't leak across sessions in the same agent process.
+export { clearChecklist };
 
 // ---------------------------------------------------------------------------
 // Helpers
