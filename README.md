@@ -23,9 +23,9 @@ surface that Superhive (or any external tool) reads and writes.
    every session.
 6. **Catalog scanner** — scans `./skills`, `./extensions`, `./prompts` and
    writes a `catalog` block listing every addable file with its active state.
-7. **8 agent-callable tools** — the LLM can also read and write the file
+7. **10 agent-callable tools** — the LLM can also read and write the file
    directly (list_sessions, get_session_detail, update_settings,
-   toggle_resource, list_catalog, etc.).
+   update_project_description, toggle_resource, list_catalog, etc.).
 
 ## File format
 
