@@ -55,14 +55,13 @@ const getCurrentSettingsTool = defineTool({
 // Tool 2: update_settings (JSON Merge Patch)
 // ---------------------------------------------------------------------------
 
-// Keys at the top level that no agent may touch via `update_settings`. The
-// project block is fenced off because coordinators (and only coordinators)
-// have one, and we want any changes to `project.*` to flow through the
-// narrow `update_project_description` tool so a single LLM call can never
-// clobber the rest of the project metadata (id, members, localPath,
-// coordinatorAgentId). Patches whose top-level keys include one of these
-// are rejected up front.
-const UPDATE_SETTINGS_FORBIDDEN_KEYS: ReadonlySet<string> = new Set(["project"]);
+// Keys at the top level that no agent may touch via `update_settings`.
+// Patches whose top-level keys include one of these are rejected up
+// front. The `project` block was previously fenced so coordinators had to
+// write `project.description` through a narrow `update_project_description`
+// tool; that tool has been retired, and the project block is now
+// reachable via the general `update_settings` flow.
+const UPDATE_SETTINGS_FORBIDDEN_KEYS: ReadonlySet<string> = new Set();
 
 function patchContainsForbiddenKey(patch: unknown, forbidden: ReadonlySet<string>): string | null {
 	if (patch === null || typeof patch !== "object" || Array.isArray(patch)) return null;
@@ -84,7 +83,7 @@ const updateSettingsTool = defineTool({
 	name: "update_settings",
 	label: "Update Settings",
 	description:
-		"Apply a partial update to the settings file. The patch is deep-merged into the current settings. Changes that can be live-applied take effect immediately; others set a flag and require a /reload. Patches that include a `project` key are rejected — use `update_project_description` for the project description.",
+		"Apply a partial update to the settings file. The patch is deep-merged into the current settings. Changes that can be live-applied take effect immediately; others set a flag and require a /reload.",
 	parameters: UpdateSettingsParams,
 
 	async execute(_id, params, _signal, _onUpdate, _ctx) {
@@ -92,7 +91,7 @@ const updateSettingsTool = defineTool({
 		if (forbidden !== null) {
 			return jsonResult({
 				ok: false,
-				error: `update_settings cannot patch "${forbidden}". Use the dedicated tool for that field (e.g. update_project_description).`,
+				error: `update_settings cannot patch "${forbidden}". Use the dedicated tool for that field.`,
 			});
 		}
 		const current = getSettings();
@@ -104,63 +103,6 @@ const updateSettingsTool = defineTool({
 			writtenVersion: nextCounter,
 			path,
 			message: "Settings updated. Some changes may require a /reload to take full effect.",
-		});
-	},
-});
-
-// ---------------------------------------------------------------------------
-// Tool 2b: update_project_description (coordinator-only, narrow write)
-// ---------------------------------------------------------------------------
-
-// Hard cap on the description an agent can write. Long enough for one or
-// two full sentences, short enough that the right-sidebar overview tab
-// stays scannable. Over-cap input is rejected up front so the agent can
-// retry with a tighter summary.
-const PROJECT_DESCRIPTION_MAX_CHARS = 280;
-
-const UpdateProjectDescriptionParams = Type.Object({
-	text: Type.String({
-		description:
-			"A short description of what this project is about. One or two sentences, plain text, no markdown. Max 280 characters.",
-	}),
-});
-
-const updateProjectDescriptionTool = defineTool({
-	name: "update_project_description",
-	label: "Update Project Description",
-	description:
-		"Update the project description shown in the right sidebar's project overview tab. Coordinator-only — this is the narrow write path for `settings.project.description`. The patch can ONLY touch the `description` field; any other change to the project block is not supported here. Use update_settings for everything else.",
-	parameters: UpdateProjectDescriptionParams,
-
-	async execute(_id, params, _signal, _onUpdate, _ctx) {
-		const text = params.text.trim();
-		if (text.length === 0) {
-			return jsonResult({
-				ok: false,
-				error: "Project description cannot be empty.",
-			});
-		}
-		if (text.length > PROJECT_DESCRIPTION_MAX_CHARS) {
-			return jsonResult({
-				ok: false,
-				error: `Project description is ${text.length} characters; max is ${PROJECT_DESCRIPTION_MAX_CHARS}.`,
-			});
-		}
-		const current = getSettings();
-		// Preserve every existing project field; only swap `description`.
-		const nextProject = {
-			...(current.project ?? { id: "", name: "", description: "", members: [] }),
-			description: text,
-		};
-		const merged: SettingsFile = { ...current, project: nextProject };
-		const path = getSettingsPath();
-		const nextCounter = setSettings(merged);
-		return jsonResult({
-			ok: true,
-			writtenVersion: nextCounter,
-			path,
-			description: text,
-			message: "Project description updated.",
 		});
 	},
 });
