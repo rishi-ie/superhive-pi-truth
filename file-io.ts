@@ -20,12 +20,14 @@ import {
 	validateAndNormalizeOverview,
 	validateAndNormalizePlanExtension,
 	validateAndNormalizeSettings,
+	validateAndNormalizeSpawnExtension,
 	type InboxFile,
 	type ManageFile,
 	type OrchExtensionFile,
 	type OverviewFile,
 	type PlanExtensionFile,
 	type SettingsFile,
+	type SpawnExtensionFile,
 } from "./settings-schema.ts";
 
 const WRITER_TAG = "superhive-pi-truth@1";
@@ -149,5 +151,13 @@ export function readOrchestrationExtension(filePath: string): OrchExtensionFile 
 }
 
 export function writeOrchestrationExtension(filePath: string, file: OrchExtensionFile): number {
+	return writeAtomic(filePath, file);
+}
+
+export function readSpawnExtension(filePath: string): SpawnExtensionFile | null {
+	return readValidated(filePath, validateAndNormalizeSpawnExtension) as SpawnExtensionFile | null;
+}
+
+export function writeSpawnExtension(filePath: string, file: SpawnExtensionFile): number {
 	return writeAtomic(filePath, file);
 }
