@@ -342,7 +342,6 @@ const updateChecklistTool = defineTool({
 export function registerAllTools(pi: ExtensionAPI): void {
 	pi.registerTool(getCurrentSettingsTool);
 	pi.registerTool(updateSettingsTool);
-	pi.registerTool(updateProjectDescriptionTool);
 	pi.registerTool(listSessionsTool);
 	pi.registerTool(getSessionDetailTool);
 	pi.registerTool(getSessionTreeTool);
