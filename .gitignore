@@ -1,0 +1,3 @@
+# transient typecheck-only files (see gap-5 pattern)
+node_modules
+tsconfig.json

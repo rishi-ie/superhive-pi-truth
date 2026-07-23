@@ -812,6 +812,31 @@ export interface OrchExtensionFile {
 	roleFragmentAppended?: "coordinator" | "member" | null;
 }
 
+/**
+ * The spawn extension's settings file. Project-agent-only gate is
+ * enforced at runtime (Phase E `superhive-pi-spawn`); the truth file
+ * itself carries no project membership — that's the spawn ext's
+ * responsibility to read from manage.json + AGENT_ID.
+ *
+ * Cascade behavior (added in Phase E):
+ *   - manage.extensions[] gains `./extensions/superhive-pi-spawn` →
+ *     create `<agentDir>/superhive-pi-spawn.json` with DEFAULT_SPAWN_EXTENSION
+ *   - manage.extensions[] loses it → set `enabled: false` (preserve user's
+ *     `allowedTemplates` + `requireApproval` overrides)
+ *
+ * `allowedTemplates: null` means "any template allowed". An array means
+ * "only these template ids are allowed"; the spawn ext reads this and
+ * rejects `spawn_agent({template})` calls outside the list.
+ */
+export interface SpawnExtensionFile {
+	version: 1;
+	managedBy?: string;
+	lastModified?: string;
+	enabled?: boolean;
+	allowedTemplates?: string[] | null;
+	requireApproval?: boolean;
+}
+
 export const DEFAULT_PLAN_EXTENSION: PlanExtensionFile = {
 	version: 1,
 	managedBy: "superhive-pi-truth@1",
