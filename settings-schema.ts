@@ -852,6 +852,29 @@ export const DEFAULT_ORCH_EXTENSION: OrchExtensionFile = {
 };
 
 /**
+ * Default values written to a fresh `<agentDir>/superhive-pi-spawn.json`
+ * when the cascade engine detects that manage.extensions[] has gained
+ * `./extensions/superhive-pi-spawn`.
+ *
+ * `enabled: true` reflects the user's intent (they just toggled it on).
+ * `allowedTemplates: null` means "any template is allowed"; an array
+ * would be an allowlist. `requireApproval: false` means spawns proceed
+ * without a permission ask.
+ *
+ * When the user toggles the ext OFF in Manage, the cascade engine does
+ * NOT delete the file — it writes `enabled: false` while preserving the
+ * user's `allowedTemplates` + `requireApproval` so the next toggle-on
+ * restores their config.
+ */
+export const DEFAULT_SPAWN_EXTENSION: SpawnExtensionFile = {
+	version: 1,
+	managedBy: "superhive-pi-truth@1",
+	enabled: true,
+	allowedTemplates: null,
+	requireApproval: false,
+};
+
+/**
  * Per-extension file path helpers.
  *
  * Naming convention: `<agentDir>/<ext-name>.json`. Truth ext owns these
@@ -863,6 +886,10 @@ export function planExtensionPathFor(agentDir: string): string {
 
 export function orchestrationExtensionPathFor(agentDir: string): string {
 	return nodePath.join(agentDir, "superhive-pi-orchestration.json");
+}
+
+export function spawnExtensionPathFor(agentDir: string): string {
+	return nodePath.join(agentDir, "superhive-pi-spawn.json");
 }
 
 export function validateAndNormalizePlanExtension(raw: unknown): PlanExtensionFile {
@@ -891,4 +918,25 @@ export function validateAndNormalizeOrchestrationExtension(raw: unknown): OrchEx
 		throw new Error(`superhive-pi-orchestration.json version ${obj.version} is newer than this extension supports.`);
 	}
 	return deepMerge(structuredClone(DEFAULT_ORCH_EXTENSION), obj) as OrchExtensionFile;
+}
+
+export function validateAndNormalizeSpawnExtension(raw: unknown): SpawnExtensionFile {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+		throw new Error("superhive-pi-spawn.json must be a JSON object");
+	}
+	const obj = raw as Record<string, unknown>;
+	if (typeof obj.version !== "number") {
+		throw new Error("superhive-pi-spawn.json missing required field: version");
+	}
+	if (obj.version > VERSION) {
+		throw new Error(`superhive-pi-spawn.json version ${obj.version} is newer than this extension supports.`);
+	}
+	// Normalize allowedTemplates: empty array is treated as null (allow-all)
+	// so the cascade's "preserve user overrides" path doesn't end up with
+	// an empty allowlist that blocks every spawn. The renderer should never
+	// produce an empty allowlist intentionally; if it does, fail open.
+	if (Array.isArray(obj.allowedTemplates) && obj.allowedTemplates.length === 0) {
+		obj.allowedTemplates = null;
+	}
+	return deepMerge(structuredClone(DEFAULT_SPAWN_EXTENSION), obj) as SpawnExtensionFile;
 }
