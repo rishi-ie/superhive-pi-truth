@@ -770,3 +770,100 @@ function deepMerge<T>(base: T, overrides: unknown): T {
 	}
 	return result as T;
 }
+
+// ---------------------------------------------------------------------------
+// Per-extension settings files
+//
+// Every Pi extension loaded for an agent gets its own settings file at
+// `<agentDir>/<ext-name>.json`. Truth (this extension) is the canonical
+// writer via the cascade engine. The user-editable `manage.json` cascades
+// the relevant knobs into each extension's file, and each extension
+// reads its file directly via fs — no IPC bridge.
+//
+// Today only `superhive-pi-plan` and `superhive-pi-orchestration` are
+// wired up. New extensions add a new file type + cascade entry below.
+// ---------------------------------------------------------------------------
+
+/**
+ * The plan extension's settings file. Mirrors `manage.json.planMode` plus
+ * whatever plan writes itself (none today).
+ */
+export interface PlanExtensionFile {
+	version: 1;
+	managedBy?: string;
+	lastModified?: string;
+	planMode?: PlanModeSettings;
+}
+
+/**
+ * The orchestration extension's settings file. Holds the `project` block
+ * (mirrored from manage.json), the CEO/system prompt the orchestrator
+ * builds, and any orchestration-internal state.
+ *
+ * Truth's cascade engine mirrors `orchestration.systemPrompt` into
+ * `settings.json` because the Pi runtime reads systemPrompt from there.
+ */
+export interface OrchExtensionFile {
+	version: 1;
+	managedBy?: string;
+	lastModified?: string;
+	project?: ProjectBlock;
+	systemPrompt?: string;
+	roleFragmentAppended?: "coordinator" | "member" | null;
+}
+
+export const DEFAULT_PLAN_EXTENSION: PlanExtensionFile = {
+	version: 1,
+	managedBy: "superhive-pi-truth@1",
+	planMode: { defaultMode: "auto", thinkingLevel: "inherit" },
+};
+
+export const DEFAULT_ORCH_EXTENSION: OrchExtensionFile = {
+	version: 1,
+	managedBy: "superhive-pi-truth@1",
+	project: undefined,
+	systemPrompt: "",
+	roleFragmentAppended: null,
+};
+
+/**
+ * Per-extension file path helpers.
+ *
+ * Naming convention: `<agentDir>/<ext-name>.json`. Truth ext owns these
+ * paths — extensions read them but never compute paths themselves.
+ */
+export function planExtensionPathFor(agentDir: string): string {
+	return nodePath.join(agentDir, "superhive-pi-plan.json");
+}
+
+export function orchestrationExtensionPathFor(agentDir: string): string {
+	return nodePath.join(agentDir, "superhive-pi-orchestration.json");
+}
+
+export function validateAndNormalizePlanExtension(raw: unknown): PlanExtensionFile {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+		throw new Error("superhive-pi-plan.json must be a JSON object");
+	}
+	const obj = raw as Record<string, unknown>;
+	if (typeof obj.version !== "number") {
+		throw new Error("superhive-pi-plan.json missing required field: version");
+	}
+	if (obj.version > VERSION) {
+		throw new Error(`superhive-pi-plan.json version ${obj.version} is newer than this extension supports.`);
+	}
+	return deepMerge(structuredClone(DEFAULT_PLAN_EXTENSION), obj) as PlanExtensionFile;
+}
+
+export function validateAndNormalizeOrchestrationExtension(raw: unknown): OrchExtensionFile {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+		throw new Error("superhive-pi-orchestration.json must be a JSON object");
+	}
+	const obj = raw as Record<string, unknown>;
+	if (typeof obj.version !== "number") {
+		throw new Error("superhive-pi-orchestration.json missing required field: version");
+	}
+	if (obj.version > VERSION) {
+		throw new Error(`superhive-pi-orchestration.json version ${obj.version} is newer than this extension supports.`);
+	}
+	return deepMerge(structuredClone(DEFAULT_ORCH_EXTENSION), obj) as OrchExtensionFile;
+}

@@ -16,11 +16,15 @@ import {
 	serializeTruthFile,
 	validateAndNormalizeInbox,
 	validateAndNormalizeManage,
+	validateAndNormalizeOrchestrationExtension,
 	validateAndNormalizeOverview,
+	validateAndNormalizePlanExtension,
 	validateAndNormalizeSettings,
 	type InboxFile,
 	type ManageFile,
+	type OrchExtensionFile,
 	type OverviewFile,
+	type PlanExtensionFile,
 	type SettingsFile,
 } from "./settings-schema.ts";
 
@@ -121,5 +125,29 @@ export function readInbox(filePath: string): InboxFile | null {
 }
 
 export function writeInbox(filePath: string, file: InboxFile): number {
+	return writeAtomic(filePath, file);
+}
+
+// ---------------------------------------------------------------------------
+// Per-extension settings files
+//
+// Each Pi extension loaded for an agent gets its own settings file at
+// `<agentDir>/<ext-name>.json`. Truth ext is the canonical writer via the
+// cascade engine; each extension reads its own file via fs.
+// ---------------------------------------------------------------------------
+
+export function readPlanExtension(filePath: string): PlanExtensionFile | null {
+	return readValidated(filePath, validateAndNormalizePlanExtension) as PlanExtensionFile | null;
+}
+
+export function writePlanExtension(filePath: string, file: PlanExtensionFile): number {
+	return writeAtomic(filePath, file);
+}
+
+export function readOrchestrationExtension(filePath: string): OrchExtensionFile | null {
+	return readValidated(filePath, validateAndNormalizeOrchestrationExtension) as OrchExtensionFile | null;
+}
+
+export function writeOrchestrationExtension(filePath: string, file: OrchExtensionFile): number {
 	return writeAtomic(filePath, file);
 }

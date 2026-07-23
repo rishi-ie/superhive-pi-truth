@@ -38,6 +38,11 @@ import {
 	type ApplyContext,
 } from "./applier.ts";
 import { createCatalogScanner } from "./catalog-scanner.ts";
+import {
+	CASCADE_CONFIG,
+	cascadeManageToExtensions,
+	cascadeOrchFileIntoSettings,
+} from "./cascade.ts";
 import { clearChecklist } from "./checklist.ts";
 import {
 	readInbox,
@@ -49,6 +54,7 @@ import {
 	writeOverview,
 	writeSettings,
 } from "./file-io.ts";
+import { orchestrationExtensionPathFor } from "./settings-schema.ts";
 import { createSessionsIndexer } from "./sessions-indexer.ts";
 import {
 	DEFAULT_INBOX,
@@ -80,7 +86,13 @@ interface FourFiles {
 
 interface RuntimeState {
 	paths: ReturnType<typeof truthPathsForAgentDir>;
-	watchers: { settings: Watcher | null; manage: Watcher | null; overview: Watcher | null; inbox: Watcher | null };
+	watchers: {
+		settings: Watcher | null;
+		manage: Watcher | null;
+		overview: Watcher | null;
+		inbox: Watcher | null;
+		orchestration: Watcher | null;
+	};
 	sessionsIndexer: ReturnType<typeof createSessionsIndexer> | null;
 	catalogScanner: ReturnType<typeof createCatalogScanner> | null;
 	previous: FourFiles;
@@ -88,7 +100,7 @@ interface RuntimeState {
 
 const state: RuntimeState = {
 	paths: { settings: "", manage: "", overview: "", inbox: "", legacy: "" },
-	watchers: { settings: null, manage: null, overview: null, inbox: null },
+	watchers: { settings: null, manage: null, overview: null, inbox: null, orchestration: null },
 	sessionsIndexer: null,
 	catalogScanner: null,
 	previous: { settings: DEFAULT_SETTINGS, manage: DEFAULT_MANAGE, overview: DEFAULT_OVERVIEW, inbox: DEFAULT_INBOX },
@@ -314,6 +326,11 @@ function handleManageWatcher(pi: ExtensionAPI, applyContext: ApplyContext, notif
 	reloadCaches({ settings: state.previous.settings, manage: next, overview: state.previous.overview, inbox: state.previous.inbox });
 	writeManage(paths.manage, next);
 	state.watchers.manage?.markSelfWrite();
+
+	// Cascades: project manage.json's managed knobs into each per-extension
+	// file's own slot. Bound to the manage watcher so it fires on every
+	// externally-driven write (~30 ms after the file settles).
+	void cascadeManageToExtensions(dirname(paths.settings));
 }
 
 function handleOverviewWatcher(notify: ReturnType<typeof makeNotifier>): void {
@@ -362,6 +379,19 @@ function handleInboxWatcher(notify: ReturnType<typeof makeNotifier>): void {
 	reloadCaches({ settings: state.previous.settings, manage: state.previous.manage, overview: state.previous.overview, inbox: next });
 	writeInbox(paths.inbox, next);
 	state.watchers.inbox?.markSelfWrite();
+}
+
+/**
+ * Out-cascade: when the orch file's `systemPrompt` changes (the orch
+ * extension wrote a new CEO prompt or member role fragment), mirror it
+ * into settings.json (which is what the Pi runtime actually reads). The
+ * watcher only exists if the orch ext has bootstrapped at least once.
+ */
+function handleOrchestrationWatcher(notify: ReturnType<typeof makeNotifier>): void {
+	const agentDir = dirname(getAllPaths().settings);
+	void cascadeOrchFileIntoSettings(agentDir).catch(err => {
+		notify(`orchestration→settings cascade failed: ${(err as Error).message}`, "warning");
+	});
 }
 
 function reportApplyResult(
@@ -500,6 +530,20 @@ async function runExtension(pi: ExtensionAPI, ctx: ExtensionContext): Promise<vo
 	inboxWatcher.start();
 	state.watchers.inbox = inboxWatcher;
 
+	// Orch extension file watcher — only starts if the file exists
+	// (orch ext may not be loaded for this agent). Drives the
+	// out-cascade (orchestration.systemPrompt → settings.json).
+	const orchestrationPath = orchestrationExtensionPathFor(agentRoot);
+	if (existsSync(orchestrationPath)) {
+		const orchWatcher = createWatcher(orchestrationPath, {
+			debounceMs: 100,
+			onChange: () => handleOrchestrationWatcher(notify),
+			onError: err => notify(`superhive-pi-orchestration.json watcher error: ${err.message}`, "error"),
+		});
+		orchWatcher.start();
+		state.watchers.orchestration = orchWatcher;
+	}
+
 	// 7. Apply the session model from settings.json.
 	if (four.settings.model?.provider && four.settings.model.name) {
 		void applyModel(
@@ -568,7 +612,8 @@ function teardown(): void {
 	state.watchers.manage?.stop();
 	state.watchers.overview?.stop();
 	state.watchers.inbox?.stop();
-	state.watchers = { settings: null, manage: null, overview: null, inbox: null };
+	state.watchers.orchestration?.stop();
+	state.watchers = { settings: null, manage: null, overview: null, inbox: null, orchestration: null };
 	state.sessionsIndexer?.dispose();
 	state.sessionsIndexer = null;
 	state.catalogScanner?.dispose();
