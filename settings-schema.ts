@@ -33,6 +33,44 @@ export type DoubleEscapeAction = "fork" | "tree" | "none";
 export type TreeFilterMode = "default" | "no-tools" | "user-only" | "labeled-only" | "all";
 export type OutputPad = 0 | 1;
 
+// ---------------------------------------------------------------------------
+// Plan mode (superhive-pi-plan extension)
+//
+// The plan-mode extension reads `planMode` from this file on every
+// session_start and before_agent_start. The extension is Tier-3 — truth
+// stores it but does not apply it. The `defaultMode` field controls the
+// chat-composer dropdown semantics:
+//
+//   "plan"  — force plan mode on at session_start
+//   "build" — force plan mode off; `/plan` is blocked
+//   "auto"  — upstream default; user toggles via /plan
+//
+// Cross-module rule: the canonical schema lives here. The Electron side
+// mirrors this shape in `superhive/electron/agent-settings-defaults.ts`.
+// Any change here must be mirrored in that file before commit.
+// ---------------------------------------------------------------------------
+
+export type PlanDefaultMode = "plan" | "build" | "auto";
+export type PlanThinkingLevel =
+	| "inherit"
+	| "off"
+	| "minimal"
+	| "low"
+	| "medium"
+	| "high"
+	| "xhigh"
+	| "max";
+
+export interface PlanModeSettings {
+	defaultMode: PlanDefaultMode;
+	thinkingLevel: PlanThinkingLevel;
+	defaultPlanTools?: string[];
+	safeSubcommands?: {
+		git?: string[];
+		gh?: string[];
+	};
+}
+
 export interface ModelRef {
 	provider: string;
 	name: string;
@@ -303,6 +341,11 @@ export interface SettingsFile {
 	// creation; kept fresh by the status-mirror helper on member start/stop.
 	// Read by the orchestration extension's session_start handler.
 	project?: ProjectBlock;
+
+	// Plan mode (coordinator-only). Read by the superhive-pi-plan extension
+	// on session_start and before_agent_start. Tier-3 — truth stores it
+	// but does not apply it. See `PlanModeSettings` for field semantics.
+	planMode?: PlanModeSettings;
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +414,7 @@ export const DEFAULT_SETTINGS: SettingsFile = {
 	runtime: { thinkingLevel: "medium", activeTools: [] },
 	catalog: { lastScanned: "", scanRoots: [], skills: [], extensions: [], prompts: [] },
 	sessionsIndex: { lastUpdated: "", sessions: [] },
+	planMode: { defaultMode: "auto", thinkingLevel: "inherit" },
 };
 
 // ---------------------------------------------------------------------------
