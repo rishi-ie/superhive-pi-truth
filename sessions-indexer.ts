@@ -13,7 +13,8 @@
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
-import { writeSettings, writerCounter } from "./file-io.ts";
+import { writeSettings } from "./file-io.ts";
+import { writerCounter } from "./settings-schema.ts";
 import type { LastEvent, SessionIndexEntry, SessionsIndex, SettingsFile } from "./settings-schema.ts";
 
 const THROTTLE_MS = 1000;
@@ -205,7 +206,8 @@ export function createSessionsIndexer(options: SessionsIndexerOptions): Sessions
 // Re-export for type convenience
 export type { LastEvent, SessionIndexEntry, SessionsIndex };
 // Provide writeSettings + writerCounter for callers that want the file I/O layer
-export { writeSettings, writerCounter };
+export { writeSettings };
+export { writerCounter };
 
 // Path utility for cross-module use
 export function agentSessionsDir(agentDir: string): string {

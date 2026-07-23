@@ -1,29 +1,29 @@
 /**
  * Applier: diff → runtime API calls.
  *
- * Compares the previous and current settings, then applies the diff into the
- * running Pi session:
+ * Two diff entrypoints, one per truth file the agent mutates directly:
  *
- *   Tier 1 (live-apply): model, thinking level, env, providers, tools,
- *     permissions, active tools. Pushes into the session immediately.
+ *   applySettingsDiff(prev, next) — reads settings.json
+ *     Tier 1 (live-apply): model, thinkingLevel, env, providers, activeTools,
+ *       permissions-driven tool exclusion.
+ *     Tier 2 (store + reload-flag): UI flags (theme, hideThinkingBlock,
+ *       etc.), advanced flags (shellPath, httpProxy, etc.), behavior knobs
+ *       (autoCompaction, compaction, retry, ...).
  *
- *   Tier 2 (store + reload-flag): UI flags (theme, hideThinkingBlock, etc.),
- *     advanced (shellPath, httpProxy, etc.), telemetry, keybindings. Stored
- *     in the file and applied on the next `/reload` (Pi built-in). The
- *     applier sets a `pendingReload: true` flag and surfaces a UI notification.
+ *   applyManageDiff(prev, next) — reads manage.json
+ *     Tier 1 (live-apply): permissions → setActiveTools exclusion.
+ *     Tier 2 (store + reload-flag): skills / extensions / prompts /
+ *       packages / themes path changes. Also surfaces a /reload flag when
+ *       they change.
  *
- *   Tier 3 (store only): fields the agent doesn't mutate (catalog,
- *     sessionsIndex, lastEvent). Written but never applied — they're
- *     extension-generated, external-read.
- *
- * The applier is best-effort: every step is wrapped in try/catch so a single
- * failed call (e.g. setModel with missing API key) doesn't break the rest.
+ * The applier is best-effort: every step is wrapped in try/catch so a
+ * single failed call doesn't break the rest.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { apiForProvider } from "./provider-map.ts";
-import type { SettingsFile } from "./settings-schema.ts";
+import type { ManageFile, SettingsFile } from "./settings-schema.ts";
 
 const FILESYSTEM_TOOLS = ["read", "write", "edit", "ls", "find", "grep"];
 const TERMINAL_TOOLS = ["bash"];
@@ -32,17 +32,7 @@ const API_KEY_PATTERN = /_API_KEY$/;
 
 /**
  * Operator-curated fallback context windows for providers whose models
- * Pi's bundled registry does not list. Keys are lowercased provider
- * names; model-id keys are also lowercased so settings-typed casing
- * (e.g. "Minimax-M3") matches the registry's canonical form.
- *
- * Why this exists: setModel({...}) without a contextWindow field lets
- * Pi use its internal default (200K), which is wrong for several
- * real providers. The registry is the source of truth when it has an
- * entry; this table is the source of truth when it doesn't. UI
- * surfaces in `src/pages/settings/sections/ModelsSection/ModelEntry.
- * contextWindow?` keep user overrides authoritative for providers
- * already in the registry.
+ * Pi's bundled registry does not list.
  */
 export const HARDCODED_CONTEXT_WINDOWS: Record<string, Record<string, number>> = {
 	minimax: {
@@ -52,13 +42,9 @@ export const HARDCODED_CONTEXT_WINDOWS: Record<string, Record<string, number>> =
 };
 
 export interface ApplyResult {
-	/** True if any Tier 2 fields changed and a reload is required. */
 	needsReload: boolean;
-	/** Names of Tier 1 fields that were applied. */
 	applied: string[];
-	/** Names of fields that failed to apply (with reason). */
 	failed: Array<{ field: string; reason: string }>;
-	/** Names of Tier 2 fields that require a reload. */
 	reloadFields: string[];
 }
 
@@ -66,21 +52,16 @@ export interface ApplyContext {
 	pi: ExtensionAPI;
 	hasUI: boolean;
 	notify(message: string, level?: "info" | "warning" | "error"): void;
-	/**
-	 * Look up the registry's contextWindow for a provider+model pair.
-	 * Returns undefined when the registry has no entry (e.g. a fully
-	 * custom provider Pi doesn't recognise). Callers should treat
-	 * undefined as "leave contextWindow off the setModel payload".
-	 */
 	resolveContextWindow?: (
 		provider: string,
 		name: string,
 	) => Promise<number | undefined>;
 }
 
-/**
- * Apply the diff between `prev` and `next` into the running session.
- */
+// ---------------------------------------------------------------------------
+// applySettingsDiff — settings.json
+// ---------------------------------------------------------------------------
+
 export async function applySettingsDiff(
 	prev: SettingsFile,
 	next: SettingsFile,
@@ -88,7 +69,6 @@ export async function applySettingsDiff(
 ): Promise<ApplyResult> {
 	const result: ApplyResult = { needsReload: false, applied: [], failed: [], reloadFields: [] };
 
-	// --- Tier 1: model ---
 	if (modelChanged(prev.model, next.model, ctx)) {
 		try {
 			const ok = await applyModel(next.model, ctx);
@@ -102,7 +82,6 @@ export async function applySettingsDiff(
 		}
 	}
 
-	// --- Tier 1: thinking level ---
 	if (next.runtime?.thinkingLevel && next.runtime.thinkingLevel !== prev.runtime?.thinkingLevel) {
 		try {
 			ctx.pi.setThinkingLevel(next.runtime.thinkingLevel);
@@ -112,7 +91,6 @@ export async function applySettingsDiff(
 		}
 	}
 
-	// --- Tier 1: active tools (from runtime.activeTools) ---
 	if (
 		next.runtime?.activeTools &&
 		!arraysEqual(next.runtime.activeTools, prev.runtime?.activeTools ?? [])
@@ -125,22 +103,9 @@ export async function applySettingsDiff(
 		}
 	}
 
-	// --- Tier 1: permissions (recompute excludeTools + setActiveTools) ---
-	if (permissionsChanged(prev.permissions, next.permissions)) {
-		try {
-			const excluded = computeExcludeTools(next);
-			const current = ctx.pi.getActiveTools();
-			const filtered = current.filter((t) => !excluded.includes(t));
-			if (filtered.length !== current.length) {
-				ctx.pi.setActiveTools(filtered);
-			}
-			result.applied.push("permissions");
-		} catch (err) {
-			result.failed.push({ field: "permissions", reason: (err as Error).message });
-		}
-	}
+	// Note: permissions live in manage.json only. The applyManageDiff
+	// path handles the Tier-1 activeTools exclusion. Nothing here.
 
-	// --- Tier 1: environment ---
 	if (!shallowEqualRecord(prev.environment ?? {}, next.environment ?? {})) {
 		try {
 			applyEnvironment(next.environment ?? {}, prev.environment ?? {}, ctx);
@@ -150,7 +115,6 @@ export async function applySettingsDiff(
 		}
 	}
 
-	// --- Tier 1: providers ---
 	if (providersChanged(prev.providers ?? {}, next.providers ?? {})) {
 		try {
 			applyProviders(next.providers ?? {}, prev.providers ?? {}, ctx);
@@ -160,10 +124,6 @@ export async function applySettingsDiff(
 		}
 	}
 
-	// --- Tier 1: defaultProvider / defaultModel / defaultThinkingLevel ---
-	// These flow through SettingsManager. ExtensionAPI doesn't expose direct
-	// setters, but the settings manager will pick them up on the next reload.
-	// We track them as Tier 2 so the reload flag is set when they change.
 	if (
 		prev.defaultProvider !== next.defaultProvider ||
 		prev.defaultModel !== next.defaultModel ||
@@ -172,66 +132,21 @@ export async function applySettingsDiff(
 		result.reloadFields.push("defaultProvider/defaultModel/defaultThinkingLevel");
 	}
 
-	// --- Tier 2 detection: any of these fields changing → needs reload ---
 	const tier2Fields: Array<keyof SettingsFile> = [
-		"theme",
-		"hideThinkingBlock",
-		"quietStartup",
-		"doubleEscapeAction",
-		"treeFilterMode",
-		"showHardwareCursor",
-		"editorPaddingX",
-		"outputPad",
-		"autocompleteMaxVisible",
-		"markdown",
-		"warnings",
-		"defaultProjectTrust",
-		"collapseChangelog",
-		"enableInstallTelemetry",
-		"enableAnalytics",
-		"enableSkillCommands",
-		"shellPath",
-		"shellCommandPrefix",
-		"npmCommand",
-		"externalEditor",
-		"transport",
-		"sessionDir",
-		"httpProxy",
-		"httpIdleTimeoutMs",
-		"websocketConnectTimeoutMs",
-		"terminal",
-		"images",
-		"thinkingBudgets",
-		"steeringMode",
-		"followUpMode",
-		"autoCompaction",
-		"autoRetry",
-		"compaction",
-		"branchSummary",
-		"retry",
+		"theme", "hideThinkingBlock", "quietStartup", "doubleEscapeAction", "treeFilterMode",
+		"showHardwareCursor", "editorPaddingX", "outputPad", "autocompleteMaxVisible",
+		"markdown", "warnings",
+		"defaultProjectTrust", "collapseChangelog", "enableInstallTelemetry",
+		"enableAnalytics", "enableSkillCommands",
+		"shellPath", "shellCommandPrefix", "npmCommand", "externalEditor",
+		"transport", "sessionDir", "httpProxy", "httpIdleTimeoutMs",
+		"websocketConnectTimeoutMs", "terminal", "images", "thinkingBudgets",
 		"enabledModels",
 	];
 	for (const field of tier2Fields) {
 		if (!deepEqual(prev[field], next[field])) {
 			result.reloadFields.push(field);
 		}
-	}
-
-	// --- Tier 2: skills / extensions / prompts (path add/remove) ---
-	if (!arraysEqual(prev.skills ?? [], next.skills ?? [])) {
-		result.reloadFields.push("skills");
-	}
-	if (!arraysEqual(prev.extensions ?? [], next.extensions ?? [])) {
-		result.reloadFields.push("extensions");
-	}
-	if (!arraysEqual(prev.prompts ?? [], next.prompts ?? [])) {
-		result.reloadFields.push("prompts");
-	}
-	if (!arraysEqual(prev.packages ?? [], next.packages ?? [])) {
-		result.reloadFields.push("packages");
-	}
-	if (!arraysEqual(prev.themes ?? [], next.themes ?? [])) {
-		result.reloadFields.push("themes");
 	}
 
 	if (result.reloadFields.length > 0) {
@@ -248,14 +163,61 @@ export async function applySettingsDiff(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// applyManageDiff — manage.json
+// ---------------------------------------------------------------------------
+
+export async function applyManageDiff(
+	prev: ManageFile,
+	next: ManageFile,
+	ctx: ApplyContext,
+): Promise<ApplyResult> {
+	const result: ApplyResult = { needsReload: false, applied: [], failed: [], reloadFields: [] };
+
+	// Tier 1: permissions → activeTools exclusion
+	if (permissionsChanged(prev.permissions, next.permissions)) {
+		try {
+			const excluded = computeExcludeToolsFromPermissions(next.permissions);
+			const current = ctx.pi.getActiveTools();
+			const filtered = current.filter((t) => !excluded.includes(t));
+			if (filtered.length !== current.length) {
+				ctx.pi.setActiveTools(filtered);
+			}
+			result.applied.push("permissions");
+		} catch (err) {
+			result.failed.push({ field: "permissions", reason: (err as Error).message });
+		}
+	}
+
+	// Tier 2: skills / extensions / prompts / packages / themes path changes
+	if (!arraysEqual(prev.skills ?? [], next.skills ?? [])) result.reloadFields.push("skills");
+	if (!arraysEqual(prev.extensions ?? [], next.extensions ?? [])) result.reloadFields.push("extensions");
+	if (!arraysEqual(prev.prompts ?? [], next.prompts ?? [])) result.reloadFields.push("prompts");
+	if (!arraysEqual(prev.packages ?? [], next.packages ?? [])) result.reloadFields.push("packages");
+	if (!arraysEqual(prev.themes ?? [], next.themes ?? [])) result.reloadFields.push("themes");
+
+	// Tier 2: behavior field changes (compaction/retry — need a reload to
+	// be re-read by the runtime).
+	if (!deepEqual(prev.behavior, next.behavior)) result.reloadFields.push("behavior");
+
+	if (result.reloadFields.length > 0) {
+		result.needsReload = true;
+		if (ctx.hasUI) {
+			ctx.notify(
+				`Manage changed: ${result.reloadFields.join(", ")} require /reload.`,
+				"warning",
+			);
+		}
+	}
+
+	return result;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers (shared)
 // ---------------------------------------------------------------------------
 
 function modelChanged(a: SettingsFile["model"], b: SettingsFile["model"], ctx: ApplyContext): boolean {
 	if (!b || !b.provider || !b.name) {
-		// Empty model: do not apply, but warn the user that no model is selected.
-		// Without this notification, the UI guard ("Pick a model first") is the
-		// only signal and the agent quietly falls through to the env-var fallback.
 		ctx.notify("No model selected in settings", "warning");
 		return false;
 	}
@@ -265,20 +227,6 @@ function modelChanged(a: SettingsFile["model"], b: SettingsFile["model"], ctx: A
 
 export async function applyModel(target: SettingsFile["model"], ctx: ApplyContext): Promise<boolean> {
 	if (!target?.provider || !target.name) return false;
-	// Use the public ExtensionAPI to look up the model
-	// The model registry isn't directly exposed, so we use a well-known shape
-	// and call setModel with a typed Model object.
-	// The `api` field must match the provider's wire protocol — derive it
-	// from the provider name via the shared lookup table.
-	//
-	// contextWindow / maxTokens: look up the live registry value via
-	// ctx.resolveContextWindow. When the registry has no entry for this
-	// provider+model (e.g. a fully custom provider Pi doesn't ship with)
-	// we consult HARDCODED_CONTEXT_WINDOWS, the operator-curated fallback
-	// table. Only if both are absent do we omit the field and let Pi pick
-	// its natural default. Previously these were hardcoded 200000/16384,
-	// which masked the real window for any model whose registry entry
-	// differed.
 	const resolvedWindow = ctx.resolveContextWindow
 		? await ctx.resolveContextWindow(target.provider, target.name)
 		: undefined;
@@ -307,17 +255,17 @@ export async function applyModel(target: SettingsFile["model"], ctx: ApplyContex
 	return await ctx.pi.setModel(model as Model<any>);
 }
 
-function permissionsChanged(a: SettingsFile["permissions"], b: SettingsFile["permissions"]): boolean {
+function permissionsChanged(a: ManageFile["permissions"], b: ManageFile["permissions"]): boolean {
 	if (!b) return false;
 	if (!a) return true;
 	return a.filesystem !== b.filesystem || a.terminal !== b.terminal || a.network !== b.network;
 }
 
-function computeExcludeTools(s: SettingsFile): string[] {
-	const permissions = s.permissions ?? {};
+function computeExcludeToolsFromPermissions(permissions: ManageFile["permissions"] | undefined): string[] {
+	const p = permissions ?? {};
 	const excluded: string[] = [];
-	if (permissions.filesystem === false) excluded.push(...FILESYSTEM_TOOLS);
-	if (permissions.terminal === false) excluded.push(...TERMINAL_TOOLS);
+	if (p.filesystem === false) excluded.push(...FILESYSTEM_TOOLS);
+	if (p.terminal === false) excluded.push(...TERMINAL_TOOLS);
 	return Array.from(new Set(excluded));
 }
 
@@ -326,18 +274,13 @@ function applyEnvironment(
 	prev: Record<string, string>,
 	ctx: ApplyContext,
 ): void {
-	// Remove keys that no longer exist
 	for (const key of Object.keys(prev)) {
 		if (!(key in next)) {
 			delete process.env[key];
 		}
 	}
-	// Add/update keys
 	for (const [key, value] of Object.entries(next)) {
 		process.env[key] = value;
-		// If it looks like an API key, also push into the active provider auth.
-		// The provider name is derived from the env var: strip _API_KEY and
-		// lower-case it (e.g. ANTHROPIC_API_KEY -> anthropic).
 		if (API_KEY_PATTERN.test(key)) {
 			const provider = key.slice(0, -"_API_KEY".length).toLowerCase();
 			try {
@@ -349,7 +292,7 @@ function applyEnvironment(
 	}
 }
 
-function providersChanged(a: Record<string, SettingsFile["providers"] extends string ? never : any>, b: typeof a): boolean {
+function providersChanged(a: Record<string, { name?: string; baseUrl?: string | null; apiKey?: string }>, b: typeof a): boolean {
 	return !deepEqual(a, b);
 }
 
@@ -371,15 +314,6 @@ function applyProviders(
 	}
 }
 
-/**
- * Initial-load provider registration. Called once on `session_start` after the
- * settings file is loaded, so that the `providers` block in the file becomes
- * the source of truth for `pi.registerProvider` from the very first turn.
- *
- * The watcher-driven `applySettingsDiff` only fires on external file changes,
- * so without this call the first LLM request would have no provider auth
- * (the model-resolver would fall back to env-var keys from `.env.local`).
- */
 export function applyInitialProviders(
 	providers: Record<string, { name?: string; baseUrl?: string | null; apiKey?: string }> | undefined,
 	ctx: ApplyContext,

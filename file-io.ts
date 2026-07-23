@@ -1,83 +1,125 @@
 /**
- * Atomic file I/O for the settings file.
+ * Per-file atomic I/O for the four truth files.
  *
- * - `readSettings` reads, parses, validates, and migrates the file. Returns
- *   null if the file doesn't exist yet.
- * - `writeSettings` writes atomically (tmp file + rename) and stamps
- *   `lastModified` and bumps the `version` integer used by the watcher as a
- *   writer-tag guard.
+ * Each call performs a `tmp + rename` write and stamps the file's
+ * `managedBy` field with the next counter. The watcher uses the counter
+ * to distinguish self-writes from external edits.
  *
- * The writer-tag mechanism: every write increments the `version` field in the
- * file. The watcher remembers the last-seen `version` and only re-applies
- * changes when the new `version` is higher. This prevents the agent's own
- * writes (which bump the version) from being treated as external changes
- * when the watcher fires on its own atomic rename.
+ * The four files share identical atomic semantics but live at different
+ * paths and use independent counters. Helpers here are thin wrappers
+ * over the same primitive (`writeAtomic`).
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import type { SettingsFile } from "./settings-schema.ts";
-import { serializeSettings, validateSettings } from "./settings-schema.ts";
+import {
+	serializeTruthFile,
+	validateAndNormalizeInbox,
+	validateAndNormalizeManage,
+	validateAndNormalizeOverview,
+	validateAndNormalizeSettings,
+	type InboxFile,
+	type ManageFile,
+	type OverviewFile,
+	type SettingsFile,
+} from "./settings-schema.ts";
 
 const WRITER_TAG = "superhive-pi-truth@1";
+const COUNTER_RE = /#(\d+)$/;
 
-/**
- * Read the settings file. Returns null if it does not exist. Throws on parse
- * or validation errors.
- */
-export function readSettings(filePath: string): SettingsFile | null {
-	if (!existsSync(filePath)) {
-		return null;
-	}
-	let raw: string;
-	try {
-		raw = readFileSync(filePath, "utf-8");
-	} catch (error) {
-		throw new Error(`Cannot read settings file ${filePath}: ${(error as Error).message}`);
-	}
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(raw);
-	} catch (error) {
-		throw new Error(`Invalid JSON in settings file ${filePath}: ${(error as Error).message}`);
-	}
-	return validateSettings(parsed);
+function readCounter(managedBy: string | undefined): number {
+	if (!managedBy) return 0;
+	const match = COUNTER_RE.exec(managedBy);
+	if (!match || !match[1]) return 0;
+	return Number.parseInt(match[1], 10);
 }
 
 /**
- * Write the settings file atomically. Stamps `lastModified`, sets
- * `managedBy`, and bumps the writer counter (used by the watcher as a
- * writer-tag guard).
+ * Atomic write. Writes `tmpPath`, then renames it onto `finalPath`. Stamps
+ * `managedBy` with the next counter and updates `lastModified`.
  *
- * Returns the new counter value so the caller can update its in-memory
- * last-seen counter.
+ * Returns the new counter value.
  */
-export function writeSettings(filePath: string, settings: SettingsFile): number {
+function writeAtomic(filePath: string, file: { version: 1; managedBy?: string; lastModified?: string }): number {
 	const dir = dirname(filePath);
 	if (!existsSync(dir)) {
 		mkdirSync(dir, { recursive: true });
 	}
-	const prevCounter = writerCounter(settings);
-	const nextCounter = prevCounter + 1;
-	const next: SettingsFile = {
-		...settings,
-		version: 1, // schema version (always 1 in v1)
-		managedBy: `${WRITER_TAG}#${nextCounter}`,
-		lastModified: new Date().toISOString(),
-	};
-	const json = serializeSettings(next);
+	const prev = (file.managedBy ?? `${WRITER_TAG}#0`) as string;
+	const next = readCounter(prev) + 1;
+	file.managedBy = `${WRITER_TAG}#${next}`;
+	file.lastModified = new Date().toISOString();
+	const json = serializeTruthFile(file);
 	const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
 	writeFileSync(tmp, json, "utf-8");
 	renameSync(tmp, filePath);
-	return nextCounter;
+	return next;
 }
 
 /**
- * Extract the writer counter from a settings object. Returns 0 if not set.
+ * Read + validate. Returns null if file doesn't exist. Throws on parse/validate.
  */
-export function writerCounter(settings: SettingsFile): number {
-	const tag = settings.managedBy ?? "";
-	const match = /#(\d+)$/.exec(tag);
-	if (!match) return 0;
-	return Number.parseInt(match[1], 10);
+function readValidated(filePath: string, validate: (raw: unknown) => unknown): unknown {
+	if (!existsSync(filePath)) return null;
+	let raw: string;
+	try {
+		raw = readFileSync(filePath, "utf-8");
+	} catch (err) {
+		throw new Error(`Cannot read ${filePath}: ${(err as Error).message}`);
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (err) {
+		throw new Error(`Invalid JSON in ${filePath}: ${(err as Error).message}`);
+	}
+	return validate(parsed);
+}
+
+// ---------------------------------------------------------------------------
+// settings.json
+// ---------------------------------------------------------------------------
+
+export function readSettings(filePath: string): SettingsFile | null {
+	return readValidated(filePath, validateAndNormalizeSettings) as SettingsFile | null;
+}
+
+export function writeSettings(filePath: string, file: SettingsFile): number {
+	return writeAtomic(filePath, file);
+}
+
+// ---------------------------------------------------------------------------
+// manage.json
+// ---------------------------------------------------------------------------
+
+export function readManage(filePath: string): ManageFile | null {
+	return readValidated(filePath, validateAndNormalizeManage) as ManageFile | null;
+}
+
+export function writeManage(filePath: string, file: ManageFile): number {
+	return writeAtomic(filePath, file);
+}
+
+// ---------------------------------------------------------------------------
+// overview.json
+// ---------------------------------------------------------------------------
+
+export function readOverview(filePath: string): OverviewFile | null {
+	return readValidated(filePath, validateAndNormalizeOverview) as OverviewFile | null;
+}
+
+export function writeOverview(filePath: string, file: OverviewFile): number {
+	return writeAtomic(filePath, file);
+}
+
+// ---------------------------------------------------------------------------
+// inbox.json
+// ---------------------------------------------------------------------------
+
+export function readInbox(filePath: string): InboxFile | null {
+	return readValidated(filePath, validateAndNormalizeInbox) as InboxFile | null;
+}
+
+export function writeInbox(filePath: string, file: InboxFile): number {
+	return writeAtomic(filePath, file);
 }

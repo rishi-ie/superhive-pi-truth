@@ -2,52 +2,96 @@
  * superhive-pi-truth extension entry point.
  *
  * On `session_start`:
- *   1. Compute the settings file path: `Superhive-pi-{foldername}.json` at the
- *      agent root (parent of the workspace cwd).
- *   2. If the file doesn't exist, run the first-run migration: read the
- *      current SettingsManager state and seed the file with defaults.
- *   3. Load the file (validates + migrates over defaults).
- *   4. Initialize the state singleton (used by tools.ts).
- *   5. Start the watcher; on external change, re-read and apply the diff.
- *   6. Run an initial catalog scan + sessions index.
- *   7. Register the 8 agent-callable tools.
- *   8. Subscribe to `entry_appended` to keep the sessions index fresh.
+ *   1. Resolve the four truth file paths under `<agentDir>`:
+ *      settings.json, manage.json, overview.json, inbox.json.
+ *   2. Check for a legacy `Superhive-pi-{foldername}.json`. If present
+ *      and none of the four files exist, run the one-shot migrator
+ *      (split the legacy blob across the four files, then delete the
+ *      legacy file).
+ *   3. Read + validate each file. Seed with defaults if missing.
+ *   4. Init the four-slot state singleton.
+ *   5. Sync project name/description from manage.json into overview.json
+ *      (so the right-sidebar Overview tab doesn't drift from the source
+ *      block in manage.json).
+ *   6. Surface inherited *_API_KEY env vars into settings.json.
+ *   7. Register initial providers from settings.json.
+ *   8. Start four watchers; on external change → re-read → diff → apply.
+ *   9. Apply the model from settings.json.
+ *  10. Initial catalog scan + sessions index.
+ *  11. Register all 13 agent-callable tools.
+ *  12. Subscribe to entry_appended to keep the sessions index fresh.
  *
- * On `session_shutdown`: tear down the watcher + indexers, dispose state.
+ * On `session_shutdown`: tear down the watchers + indexers, dispose state.
  *
  * The extension never reads from `manifest.json` directly — that's the
  * launcher's job. This extension is downstream of `--manifest`.
  */
 
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { dirname } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { applySettingsDiff, applyInitialProviders, applyModel } from "./applier.ts";
+import {
+	applyInitialProviders,
+	applyManageDiff,
+	applyModel,
+	applySettingsDiff,
+	type ApplyContext,
+} from "./applier.ts";
 import { createCatalogScanner } from "./catalog-scanner.ts";
 import { clearChecklist } from "./checklist.ts";
-import { readSettings, writeSettings, writerCounter } from "./file-io.ts";
+import {
+	readInbox,
+	readManage,
+	readOverview,
+	readSettings,
+	writeInbox,
+	writeManage,
+	writeOverview,
+	writeSettings,
+} from "./file-io.ts";
 import { createSessionsIndexer } from "./sessions-indexer.ts";
-import { DEFAULT_SETTINGS, type SettingsFile, settingsFilePathFor } from "./settings-schema.ts";
-import { disposeState, getSettings, initState } from "./state.ts";
+import {
+	DEFAULT_INBOX,
+	DEFAULT_MANAGE,
+	DEFAULT_OVERVIEW,
+	DEFAULT_SETTINGS,
+	migrateLegacyToFour,
+	truthPathsForAgentDir,
+	type InboxFile,
+	type ManageFile,
+	type OverviewFile,
+	type SettingsFile,
+} from "./settings-schema.ts";
+import {
+	disposeState,
+	getAllPaths,
+	initState,
+	reloadCaches,
+} from "./state.ts";
 import { registerAllTools } from "./tools.ts";
-import { createWatcher } from "./watcher.ts";
+import { createWatcher, type Watcher } from "./watcher.ts";
 
-const MANAGED_BY = "superhive-pi-truth@1";
+interface FourFiles {
+	settings: SettingsFile;
+	manage: ManageFile;
+	overview: OverviewFile;
+	inbox: InboxFile;
+}
 
 interface RuntimeState {
-	watcher: ReturnType<typeof createWatcher> | null;
+	paths: ReturnType<typeof truthPathsForAgentDir>;
+	watchers: { settings: Watcher | null; manage: Watcher | null; overview: Watcher | null; inbox: Watcher | null };
 	sessionsIndexer: ReturnType<typeof createSessionsIndexer> | null;
 	catalogScanner: ReturnType<typeof createCatalogScanner> | null;
-	previousSettings: SettingsFile | null;
-	settingsFilePath: string;
+	previous: FourFiles;
 }
 
 const state: RuntimeState = {
-	watcher: null,
+	paths: { settings: "", manage: "", overview: "", inbox: "", legacy: "" },
+	watchers: { settings: null, manage: null, overview: null, inbox: null },
 	sessionsIndexer: null,
 	catalogScanner: null,
-	previousSettings: null,
-	settingsFilePath: "",
+	previous: { settings: DEFAULT_SETTINGS, manage: DEFAULT_MANAGE, overview: DEFAULT_OVERVIEW, inbox: DEFAULT_INBOX },
 };
 
 function makeNotifier(ctx: ExtensionContext) {
@@ -62,40 +106,292 @@ function makeNotifier(ctx: ExtensionContext) {
 	};
 }
 
-function buildInitialSettings(ctx: ExtensionContext): SettingsFile {
-	// Seed the settings file from the manifest-applied state. We can't read
-	// the in-memory SettingsManager directly from the ExtensionContext, so
-	// we start from defaults. The actual values from the manifest have
-	// already been applied via --manifest in cli.ts; this file is the
-	// snapshot of "what is currently active" plus the catalog and sessions
-	// index the agent will fill in.
-	//
-	// Pin both extensions into the active manifest so Pi's loadExtensions
-	// takes the deterministic "explicit paths" branch instead of relying
-	// on directory auto-discovery — the latter silently drops one of two
-	// symlinked extensions in some Pi builds on macOS. We reach into
-	// the settings file because truth owns the manifest lifecycle; cli.ts
-	// reads `manifest.extensions` from this file at every boot.
-	const settings: SettingsFile = {
-		...DEFAULT_SETTINGS,
-		managedBy: MANAGED_BY,
+// ---------------------------------------------------------------------------
+// File loading + seeding + legacy migration
+// ---------------------------------------------------------------------------
+
+function seedSettings(): SettingsFile {
+	return {
+		...structuredClone(DEFAULT_SETTINGS),
+		managedBy: "superhive-pi-truth@1#0",
 		lastModified: new Date().toISOString(),
-		extensions: [
-			"./extensions/superhive-pi-truth",
-			"./extensions/superhive-pi-telemetry",
-		],
 	};
-	return settings;
 }
+
+function seedManage(): ManageFile {
+	return {
+		...structuredClone(DEFAULT_MANAGE),
+		managedBy: "superhive-pi-truth@1#0",
+		lastModified: new Date().toISOString(),
+	};
+}
+
+function seedOverview(): OverviewFile {
+	return {
+		...structuredClone(DEFAULT_OVERVIEW),
+		managedBy: "superhive-pi-truth@1#0",
+		lastModified: new Date().toISOString(),
+	};
+}
+
+function seedInbox(): InboxFile {
+	return {
+		...structuredClone(DEFAULT_INBOX),
+		managedBy: "superhive-pi-truth@1#0",
+		lastModified: new Date().toISOString(),
+	};
+}
+
+/**
+ * Mirror manage.json's project block into overview.json. Returns the
+ * synced OverviewFile if anything changed, null otherwise.
+ */
+function syncOverviewFromManage(manage: ManageFile, overview: OverviewFile): OverviewFile | null {
+	let next: OverviewFile | null = null;
+	if (manage.project) {
+		if (manage.project.name !== overview.name) {
+			next ??= { ...overview };
+			next.name = manage.project.name;
+		}
+		if (manage.project.description !== overview.description) {
+			next ??= { ...overview };
+			next.description = manage.project.description;
+		}
+	}
+	if (!manage.project && manage.identity) {
+		if (manage.identity.name && !overview.name) {
+			next ??= { ...overview };
+			next.name = manage.identity.name;
+		}
+		if (manage.identity.description && !overview.description) {
+			next ??= { ...overview };
+			next.description = manage.identity.description;
+		}
+	}
+	return next;
+}
+
+/**
+ * Load the four truth files: legacy migration if needed, otherwise
+ * per-file read+validate+seed. Always returns a complete FourFiles.
+ */
+function loadFourFiles(
+	paths: RuntimeState["paths"],
+	notify: ReturnType<typeof makeNotifier>,
+): FourFiles {
+	const allNew =
+		existsSync(paths.settings) &&
+		existsSync(paths.manage) &&
+		existsSync(paths.overview) &&
+		existsSync(paths.inbox);
+
+	if (!allNew && existsSync(paths.legacy)) {
+		try {
+			const raw = readFileSync(paths.legacy, "utf-8");
+			const parsed = JSON.parse(raw) as Record<string, unknown>;
+			const migrated = migrateLegacyToFour(parsed);
+			writeSettings(paths.settings, migrated.settings);
+			writeManage(paths.manage, migrated.manage);
+			writeOverview(paths.overview, migrated.overview);
+			writeInbox(paths.inbox, migrated.inbox);
+			try {
+				unlinkSync(paths.legacy);
+			} catch {
+				// best-effort cleanup
+			}
+			notify("Migrated legacy settings file to settings.json + manage.json + overview.json + inbox.json", "info");
+			return migrated;
+		} catch (err) {
+			notify(`Legacy migration failed; falling back to per-file defaults: ${(err as Error).message}`, "warning");
+		}
+	}
+
+	const settings = existsSync(paths.settings)
+		? readSettings(paths.settings) ?? seedSettings()
+		: seedAndWrite(paths.settings, seedSettings, writeSettings, notify, "settings.json");
+	const manage = existsSync(paths.manage)
+		? readManage(paths.manage) ?? seedManage()
+		: seedAndWrite(paths.manage, seedManage, writeManage, notify, "manage.json");
+	const overview = existsSync(paths.overview)
+		? readOverview(paths.overview) ?? seedOverview()
+		: seedAndWrite(paths.overview, seedOverview, writeOverview, notify, "overview.json");
+	const inbox = existsSync(paths.inbox)
+		? readInbox(paths.inbox) ?? seedInbox()
+		: seedAndWrite(paths.inbox, seedInbox, writeInbox, notify, "inbox.json");
+
+	return { settings, manage, overview, inbox };
+}
+
+function seedAndWrite<T extends { managedBy?: string }>(
+	path: string,
+	seed: () => T,
+	write: (path: string, file: T) => number,
+	notify: ReturnType<typeof makeNotifier>,
+	label: string,
+): T {
+	const file = seed();
+	write(path, file);
+	notify(`Seeded ${label}`, "info");
+	return file;
+}
+
+// ---------------------------------------------------------------------------
+// Watcher change handlers
+// ---------------------------------------------------------------------------
+
+function handleSettingsWatcher(pi: ExtensionAPI, applyContext: ApplyContext, notify: ReturnType<typeof makeNotifier>): void {
+	const paths = getAllPaths();
+	let next: SettingsFile;
+	try {
+		const loaded = readSettings(paths.settings);
+		if (!loaded) return;
+		next = loaded;
+	} catch (err) {
+		notify(`Failed to re-read settings.json: ${(err as Error).message}`, "error");
+		return;
+	}
+
+	const prev = state.previous.settings;
+	const prevCounter = Number(/(\d+)$/.exec(prev.managedBy ?? "")?.[1] ?? "0");
+	const nextCounter = Number(/(\d+)$/.exec(next.managedBy ?? "")?.[1] ?? "0");
+	if (nextCounter <= prevCounter) {
+		state.previous.settings = next;
+		return;
+	}
+
+	// Apply the diff and bump the in-memory state.
+	applySettingsDiff(prev, next, applyContext).then((result) => {
+		reportApplyResult(result, "settings.json", notify);
+	});
+	state.previous.settings = next;
+	reloadCaches({ settings: next, manage: state.previous.manage, overview: state.previous.overview, inbox: state.previous.inbox });
+	writeSettings(paths.settings, next);
+	state.watchers.settings?.markSelfWrite();
+	if (pi) {
+		// Apply model if it changed.
+		try {
+			void applyModel(next.model, applyContext);
+		} catch {
+			// ignored — applyModel reports its own failures via notify.
+		}
+	}
+}
+
+function handleManageWatcher(pi: ExtensionAPI, applyContext: ApplyContext, notify: ReturnType<typeof makeNotifier>): void {
+	const paths = getAllPaths();
+	let next: ManageFile;
+	try {
+		const loaded = readManage(paths.manage);
+		if (!loaded) return;
+		next = loaded;
+	} catch (err) {
+		notify(`Failed to re-read manage.json: ${(err as Error).message}`, "error");
+		return;
+	}
+
+	const prev = state.previous.manage;
+	const prevCounter = Number(/(\d+)$/.exec(prev.managedBy ?? "")?.[1] ?? "0");
+	const nextCounter = Number(/(\d+)$/.exec(next.managedBy ?? "")?.[1] ?? "0");
+	if (nextCounter <= prevCounter) {
+		state.previous.manage = next;
+		return;
+	}
+
+	applyManageDiff(prev, next, applyContext).then((result) => {
+		reportApplyResult(result, "manage.json", notify);
+	});
+	state.previous.manage = next;
+
+	// Sync overview from manage when project fields changed.
+	const synced = syncOverviewFromManage(next, state.previous.overview);
+	if (synced) {
+		const counter = writeOverview(paths.overview, synced);
+		state.watchers.overview?.markSelfWrite();
+		state.previous.overview = synced;
+		notify(`Synced overview.json from manage.json (writer #${counter})`, "info");
+	}
+
+	reloadCaches({ settings: state.previous.settings, manage: next, overview: state.previous.overview, inbox: state.previous.inbox });
+	writeManage(paths.manage, next);
+	state.watchers.manage?.markSelfWrite();
+}
+
+function handleOverviewWatcher(notify: ReturnType<typeof makeNotifier>): void {
+	const paths = getAllPaths();
+	let next: OverviewFile;
+	try {
+		const loaded = readOverview(paths.overview);
+		if (!loaded) return;
+		next = loaded;
+	} catch (err) {
+		notify(`Failed to re-read overview.json: ${(err as Error).message}`, "error");
+		return;
+	}
+	const prev = state.previous.overview;
+	const prevCounter = Number(/(\d+)$/.exec(prev.managedBy ?? "")?.[1] ?? "0");
+	const nextCounter = Number(/(\d+)$/.exec(next.managedBy ?? "")?.[1] ?? "0");
+	if (nextCounter <= prevCounter) {
+		state.previous.overview = next;
+		return;
+	}
+	state.previous.overview = next;
+	reloadCaches({ settings: state.previous.settings, manage: state.previous.manage, overview: next, inbox: state.previous.inbox });
+	writeOverview(paths.overview, next);
+	state.watchers.overview?.markSelfWrite();
+}
+
+function handleInboxWatcher(notify: ReturnType<typeof makeNotifier>): void {
+	const paths = getAllPaths();
+	let next: InboxFile;
+	try {
+		const loaded = readInbox(paths.inbox);
+		if (!loaded) return;
+		next = loaded;
+	} catch (err) {
+		notify(`Failed to re-read inbox.json: ${(err as Error).message}`, "error");
+		return;
+	}
+	const prev = state.previous.inbox;
+	const prevCounter = Number(/(\d+)$/.exec(prev.managedBy ?? "")?.[1] ?? "0");
+	const nextCounter = Number(/(\d+)$/.exec(next.managedBy ?? "")?.[1] ?? "0");
+	if (nextCounter <= prevCounter) {
+		state.previous.inbox = next;
+		return;
+	}
+	state.previous.inbox = next;
+	reloadCaches({ settings: state.previous.settings, manage: state.previous.manage, overview: state.previous.overview, inbox: next });
+	writeInbox(paths.inbox, next);
+	state.watchers.inbox?.markSelfWrite();
+}
+
+function reportApplyResult(
+	result: { applied: string[]; failed: Array<{ field: string; reason: string }>; needsReload: boolean },
+	label: string,
+	notify: ReturnType<typeof makeNotifier>,
+): void {
+	if (result.applied.length > 0) notify(`[${label}] Applied: ${result.applied.join(", ")}`, "info");
+	for (const f of result.failed) {
+		notify(`[${label}] Failed: ${f.field} — ${f.reason}`, "warning");
+		try {
+			process.stderr.write(`[superhive-pi-truth] apply failed: ${f.field} — ${f.reason}\n`);
+		} catch {
+			// ignore
+		}
+	}
+	if (result.needsReload) notify(`${label}: some changes require /reload`, "warning");
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
 
 async function runExtension(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
 	const workspace = ctx.cwd;
-	state.settingsFilePath = settingsFilePathFor(workspace);
+	const paths = truthPathsForAgentDir(dirname(workspace));
+	state.paths = paths;
 
 	const notify = makeNotifier(ctx);
 
-	// Surface the agent dir to peer extensions via env. The telemetry
-	// extension uses this as a fallback when ctx.cwd is empty.
 	const agentRoot = dirname(workspace);
 	process.env.AGENT_DIR = agentRoot;
 	process.env.PI_AGENT_DIR = agentRoot;
@@ -107,182 +403,122 @@ async function runExtension(pi: ExtensionAPI, ctx: ExtensionContext): Promise<vo
 		try {
 			const catalog = await ctx.modelRegistry?.getAvailable?.();
 			if (!catalog) return undefined;
-			// Case-insensitive on provider and id: settings files often carry
-			// display casing (e.g. "Minimax") that differs from Pi's registry
-			// keys (e.g. "minimax"). Without the lowercase, the lookup misses
-			// and applyModel falls through to a partial setModel payload that
-			// has no contextWindow field — which then surfaces the wrong cap
-			// (or none) in the ring.
 			const providerLc = provider.toLowerCase();
 			const nameLc = name.toLowerCase();
 			const match = catalog.find(
-				(m) =>
-					m.provider.toLowerCase() === providerLc &&
-					m.id.toLowerCase() === nameLc,
+				m => m.provider.toLowerCase() === providerLc && m.id.toLowerCase() === nameLc,
 			);
 			return match?.contextWindow;
 		} catch (err) {
-			notify(
-				`resolveContextWindow failed: ${(err as Error).message}`,
-				"warning",
-			);
+			notify(`resolveContextWindow failed: ${(err as Error).message}`, "warning");
 			return undefined;
 		}
 	};
 
-	const applyContext = { pi, hasUI: ctx.hasUI, notify, resolveContextWindow };
+	const applyContext: ApplyContext = { pi, hasUI: ctx.hasUI, notify, resolveContextWindow };
 
-	// 1. First-run migration: if the file doesn't exist, seed it.
-	if (!existsSync(state.settingsFilePath)) {
-		notify("First run: seeding settings file", "info");
-		const initial = buildInitialSettings(ctx);
-		writeSettings(state.settingsFilePath, initial);
+	// 1. Load (or seed + migrate) the four truth files.
+	const four = loadFourFiles(paths, notify);
+
+	// 2. Sync overview.json from manage.json.
+	const syncedOverview = syncOverviewFromManage(four.manage, four.overview);
+	if (syncedOverview) {
+		writeOverview(paths.overview, syncedOverview);
+		state.watchers.overview?.markSelfWrite();
+		four.overview = syncedOverview;
+		notify("Synced overview.json from manage.json", "info");
 	}
 
-	// 1a. Backfill: existing settings files created before this commit
-	// may have an empty `extensions` block. We need both truth and
-	// telemetry in the active manifest so Pi's loadExtensions takes the
-	// explicit paths branch; without this, only directory auto-discovery
-	// runs and one of the two symlinked extensions is silently dropped
-	// on some Pi/macOS combinations.
-	const REQUIRED_EXTENSIONS = [
-		"./extensions/superhive-pi-truth",
-		"./extensions/superhive-pi-telemetry",
-	] as const;
-	{
-		let loaded: SettingsFile | null = null;
-		try {
-			loaded = readSettings(state.settingsFilePath);
-		} catch {
-			loaded = null;
-		}
-		const have = Array.isArray(loaded?.extensions) ? loaded!.extensions : [];
-		const missing = REQUIRED_EXTENSIONS.filter((e) => !have.includes(e));
-		if (missing.length > 0 && loaded) {
-			const next: SettingsFile = {
-				...loaded,
-				extensions: [...have, ...missing],
-				lastModified: new Date().toISOString(),
-			};
-			try {
-				writeSettings(state.settingsFilePath, next);
-				notify(
-					`Backfilled extensions in settings file (added: ${missing.join(", ")})`,
-					"info",
-				);
-			} catch (err) {
-				notify(
-					`Failed to backfill extensions: ${(err as Error).message}`,
-					"warning",
-				);
-			}
-		}
-	}
+	state.previous = four;
 
-	// 2. Load + validate.
-	let current: SettingsFile;
-	try {
-		const loaded = readSettings(state.settingsFilePath);
-		if (!loaded) {
-			throw new Error("readSettings returned null after first-run seed");
-		}
-		current = loaded;
-	} catch (err) {
-		notify(`Failed to load settings: ${(err as Error).message}`, "error");
-		// Fall back to defaults so the agent can still run
-		current = { ...DEFAULT_SETTINGS, managedBy: MANAGED_BY };
-	}
-
-	// 3. Init state singleton.
+	// 3. Init the four-slot state singleton.
 	initState({
-		settingsFilePath: state.settingsFilePath,
-		settings: current,
+		settingsFilePath: paths.settings,
+		manageFilePath: paths.manage,
+		overviewFilePath: paths.overview,
+		inboxFilePath: paths.inbox,
+		settings: four.settings,
+		manage: four.manage,
+		overview: four.overview,
+		inbox: four.inbox,
 		notify,
 	});
-	state.previousSettings = current;
 
-	// 3a. First-launch env migration: surface inherited *_API_KEY env vars
-	//     into the settings JSON so the file becomes the source of truth.
-	//     This runs every session; the no-op case is when the JSON already
-	//     contains the keys (subsequent launches). Newly seen keys get persisted.
+	// 4. First-launch env migration into settings.json.
 	{
 		const envPatch: Record<string, string> = {};
-		const currentEnv = current.environment ?? {};
+		const currentEnv = four.settings.environment ?? {};
 		for (const [k, v] of Object.entries(process.env)) {
-			if (v && /_API_KEY$/.test(k) && !currentEnv[k]) {
-				envPatch[k] = v;
-			}
+			if (v && typeof v === "string" && /_API_KEY$/.test(k) && !currentEnv[k]) envPatch[k] = v;
 		}
 		if (Object.keys(envPatch).length > 0) {
 			const merged: SettingsFile = {
-				...current,
+				...four.settings,
 				environment: { ...currentEnv, ...envPatch },
 			};
-			try {
-				writeSettings(state.settingsFilePath, merged);
-				applySettingsDiff(current, merged, applyContext);
-				state.previousSettings = merged;
-				notify(
-					`Seeded ${Object.keys(envPatch).length} API key(s) from process.env into settings`,
-					"info",
-				);
-			} catch (err) {
-				notify(
-					`Failed to seed env keys: ${(err as Error).message}`,
-					"error",
-				);
-			}
+			const counter = writeSettings(paths.settings, merged);
+			state.watchers.settings?.markSelfWrite();
+			state.previous.settings = merged;
+			four.settings = merged;
+			notify(`Seeded ${Object.keys(envPatch).length} API key(s) from process.env into settings.json (writer #${counter})`, "info");
 		}
 	}
 
-	// 3b. Register the providers block on first load. The watcher only
-	//     triggers on external file changes, so without this call the
-	//     first LLM request would have no provider auth and would fall
-	//     through to the env-var fallback. This makes the file's
-	//     `providers` block the source of truth from the very first turn.
-	applyInitialProviders(current.providers, applyContext);
+	// 5. Register initial providers from settings.json.
+	applyInitialProviders(four.settings.providers, applyContext);
 
-	// 4. Start watcher. On external change → re-read → diff → apply.
-	state.watcher = createWatcher(state.settingsFilePath, {
+	// 6. Watchers — one per file.
+	const settingsWatcher = createWatcher(paths.settings, {
 		debounceMs: 100,
-		onChange: () => {
-			handleWatcherChange(pi, ctx, notify);
-		},
-		onError: (err) => {
-			notify(`Settings watcher error: ${err.message}`, "error");
-		},
+		onChange: () => handleSettingsWatcher(pi, applyContext, notify),
+		onError: err => notify(`settings.json watcher error: ${err.message}`, "error"),
 	});
-	state.watcher.start();
+	settingsWatcher.start();
+	state.watchers.settings = settingsWatcher;
 
-	// 4a. Force the session model onto whatever the settings file names.
-	// Pi's findInitialModel falls through to the provider default when its
-	// case-sensitive registry find misses (settings carry display casing
-	// like "Minimax" / "Minimax-M3" while the registry uses "minimax" /
-	// "MiniMax-M3"). Without this, the session comes up on M2.7 (the
-	// defaultModelPerProvider.minimax fallback) even though the file
-	// names M3, and the context ring stays at 204K. applyModel does its
-	// own case-insensitive lookup against ctx.modelRegistry.getAvailable()
-	// and HARDCODED_CONTEXT_WINDOWS, so it correctly resolves 1M here.
-	// Skipped silently when the file has no model selected yet.
-	if (state.settings?.model?.provider && state.settings.model.name) {
+	const manageWatcher = createWatcher(paths.manage, {
+		debounceMs: 100,
+		onChange: () => handleManageWatcher(pi, applyContext, notify),
+		onError: err => notify(`manage.json watcher error: ${err.message}`, "error"),
+	});
+	manageWatcher.start();
+	state.watchers.manage = manageWatcher;
+
+	const overviewWatcher = createWatcher(paths.overview, {
+		debounceMs: 100,
+		onChange: () => handleOverviewWatcher(notify),
+		onError: err => notify(`overview.json watcher error: ${err.message}`, "error"),
+	});
+	overviewWatcher.start();
+	state.watchers.overview = overviewWatcher;
+
+	const inboxWatcher = createWatcher(paths.inbox, {
+		debounceMs: 100,
+		onChange: () => handleInboxWatcher(notify),
+		onError: err => notify(`inbox.json watcher error: ${err.message}`, "error"),
+	});
+	inboxWatcher.start();
+	state.watchers.inbox = inboxWatcher;
+
+	// 7. Apply the session model from settings.json.
+	if (four.settings.model?.provider && four.settings.model.name) {
 		void applyModel(
-			{ provider: state.settings.model.provider, name: state.settings.model.name },
+			{ provider: four.settings.model.provider, name: four.settings.model.name },
 			applyContext,
 		);
 	}
 
-	// 5. Initial catalog scan + sessions index.
-	const workspaceRoot = dirname(workspace);
-	const agentDir = join(workspaceRoot, ".pi", "agent");
-
+	// 8. Initial catalog scan + sessions index (writes back to settings.json).
+	const agentDir = agentRoot;
 	state.catalogScanner = createCatalogScanner({
 		workspace,
-		getSettings,
+		getSettings: () => state.previous.settings,
 		setSettings: (s) => {
-			const counter = writeSettings(state.settingsFilePath, s);
-			state.watcher?.markSelfWrite();
-			notify(`Settings written (writer #${counter})`, "info");
+			writeSettings(paths.settings, s);
+			state.watchers.settings?.markSelfWrite();
+			state.previous.settings = s;
 		},
+		getManage: () => state.previous.manage,
 		notify,
 	});
 	state.catalogScanner.refresh();
@@ -290,20 +526,21 @@ async function runExtension(pi: ExtensionAPI, ctx: ExtensionContext): Promise<vo
 	state.sessionsIndexer = createSessionsIndexer({
 		agentDir,
 		workspace,
-		settingsFilePath: state.settingsFilePath,
-		getSettings,
+		settingsFilePath: paths.settings,
+		getSettings: () => state.previous.settings,
 		setSettings: (s) => {
-			writeSettings(state.settingsFilePath, s);
-			state.watcher?.markSelfWrite();
+			writeSettings(paths.settings, s);
+			state.watchers.settings?.markSelfWrite();
+			state.previous.settings = s;
 		},
 		notify,
 	});
 	state.sessionsIndexer.refresh();
 
-	// 6. Register tools.
+	// 9. Register the 13 tools.
 	registerAllTools(pi);
 
-	// 7. Subscribe to entry_appended for live sessions index updates.
+	// 10. Subscribe to entry_appended for live sessions index updates.
 	pi.on("entry_appended", (event) => {
 		const e = event as unknown as { type: string; sessionId?: string; entryId?: string; timestamp?: string };
 		state.sessionsIndexer?.onEntryAppended({
@@ -314,7 +551,7 @@ async function runExtension(pi: ExtensionAPI, ctx: ExtensionContext): Promise<vo
 		});
 	});
 
-	// 8. (Optional) Register a slash command to force-rescan the catalog.
+	// 11. Slash command to force rescan.
 	pi.registerCommand("superhive-rescan", {
 		description: "Rescan the catalog of skills/extensions/prompts and rebuild the sessions index.",
 		handler: async (_args, _ctx) => {
@@ -323,70 +560,20 @@ async function runExtension(pi: ExtensionAPI, ctx: ExtensionContext): Promise<vo
 		},
 	});
 
-	notify("superhive-pi-truth: settings file is the single source of truth", "info");
-}
-
-function handleWatcherChange(pi: ExtensionAPI, ctx: ExtensionContext, notify: (msg: string, level?: "info" | "warning" | "error") => void): void {
-	let next: SettingsFile;
-	try {
-		const loaded = readSettings(state.settingsFilePath);
-		if (!loaded) return;
-		next = loaded;
-	} catch (err) {
-		notify(`Failed to re-read settings: ${(err as Error).message}`, "error");
-		return;
-	}
-
-	const prev = state.previousSettings ?? next;
-	if (writerCounter(next) <= writerCounter(prev)) {
-		// Self-write or no-op change.
-		state.previousSettings = next;
-		return;
-	}
-
-	// Update in-memory state immediately so tools see the new value.
-	// The write goes through the same atomic write + counter bump, so
-	// the watcher will treat this as a self-write and skip.
-	initState({ settingsFilePath: state.settingsFilePath, settings: next, notify });
-	state.previousSettings = next;
-	writeSettings(state.settingsFilePath, next);
-	state.watcher?.markSelfWrite();
-
-	// Apply the diff to the running session.
-	applySettingsDiff(prev, next, applyContext).then((result) => {
-		if (result.applied.length > 0) {
-			notify(`Applied: ${result.applied.join(", ")}`, "info");
-		}
-		if (result.failed.length > 0) {
-			for (const f of result.failed) {
-				notify(`Failed: ${f.field} — ${f.reason}`, "warning");
-				// Also write to stderr so the main process picks it up
-				// in main.log. The in-Pi notify is only visible inside
-				// the agent, but the renderer needs the failure to
-				// surface during integration debugging.
-				try {
-					process.stderr.write(
-						`[superhive-pi-truth] apply failed: ${f.field} — ${f.reason}\n`,
-					);
-				} catch {
-					// ignore
-				}
-			}
-		}
-		if (result.needsReload) {
-			notify("Some changes require /reload to take full effect", "warning");
-		}
-	});
+	notify("superhive-pi-truth: 4-file split active (settings.json / manage.json / overview.json / inbox.json)", "info");
 }
 
 function teardown(): void {
-	state.watcher?.stop();
-	state.watcher = null;
+	state.watchers.settings?.stop();
+	state.watchers.manage?.stop();
+	state.watchers.overview?.stop();
+	state.watchers.inbox?.stop();
+	state.watchers = { settings: null, manage: null, overview: null, inbox: null };
 	state.sessionsIndexer?.dispose();
 	state.sessionsIndexer = null;
 	state.catalogScanner?.dispose();
 	state.catalogScanner = null;
-	state.previousSettings = null;
+	state.previous = { settings: DEFAULT_SETTINGS, manage: DEFAULT_MANAGE, overview: DEFAULT_OVERVIEW, inbox: DEFAULT_INBOX };
 	clearChecklist();
 	disposeState();
 }

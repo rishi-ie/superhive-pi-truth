@@ -1,20 +1,30 @@
 /**
  * Agent-callable tools for superhive-pi-truth.
  *
- * These are the LLM-facing surface of the extension. Each tool reads or
- * mutates the settings file. Mutations go through `writeSettings`, which
- * bumps the writer counter so the watcher knows the change was made by
- * the agent itself (no echo loop).
+ * The 13 tools split across the four truth files:
+ *   settings.json (slim):  get_current_settings, update_settings,
+ *                          list_sessions, get_session_detail,
+ *                          get_session_tree, get_session_stats,
+ *                          list_catalog, update_checklist
+ *   manage.json:           update_manage, toggle_resource
+ *   overview.json:         update_overview
+ *   inbox.json:            append_inbox, mark_inbox_read, clear_inbox
+ *
+ * Mutations go through `setSettings/setManage/setOverview/setInbox` which
+ * bump the file's writer counter so the watcher knows the change was made
+ * by the agent itself (no echo loop).
  *
  * Conventions:
  * - All parameter schemas use TypeBox (aliased by jiti to the fork's copy).
- * - Tools return a single text content block with a JSON-stringified payload
- *   for easy parsing.
+ * - Tools return a single text content block with a JSON-stringified payload.
  */
 
 import { Type, type Static } from "typebox";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getSettings, getSettingsPath, setSettings } from "./state.ts";
+import {
+	getInbox, getInboxPath, getManage, getManagePath, getOverview, getOverviewPath, getSettings,
+	getSettingsPath, setInbox, setManage, setOverview, setSettings,
+} from "./state.ts";
 import {
 	clearChecklist,
 	emitChecklistToJournal,
@@ -22,11 +32,7 @@ import {
 	setChecklist,
 	type ChecklistItem,
 } from "./checklist.ts";
-import type { SettingsFile } from "./settings-schema.ts";
-
-export interface ToolsContext {
-	settingsFilePath: string;
-}
+import type { InboxFile, InboxItem, ManageFile, OverviewFile, SettingsFile } from "./settings-schema.ts";
 
 function jsonResult(data: unknown) {
 	return {
@@ -36,44 +42,20 @@ function jsonResult(data: unknown) {
 }
 
 // ---------------------------------------------------------------------------
-// Tool 1: get_current_settings
+// settings.json — get + read + write the runtime essentials
 // ---------------------------------------------------------------------------
 
 const getCurrentSettingsTool = defineTool({
 	name: "get_current_settings",
 	label: "Get Current Settings",
 	description:
-		"Return the full Superhive-pi-{foldername}.json contents (all settings, runtime state, catalog, sessions index, last event).",
+		"Return the contents of `<agentDir>/settings.json` (model, env, providers, runtime, tier-2 UI flags, sessions index, catalog).",
 	parameters: Type.Object({}),
 
 	async execute(_id, _params, _signal, _onUpdate, _ctx) {
 		return jsonResult({ ok: true, settings: getSettings() });
 	},
 });
-
-// ---------------------------------------------------------------------------
-// Tool 2: update_settings (JSON Merge Patch)
-// ---------------------------------------------------------------------------
-
-// Keys at the top level that no agent may touch via `update_settings`.
-// Patches whose top-level keys include one of these are rejected up
-// front. The `project` block was previously fenced so coordinators had to
-// write `project.description` through a narrow `update_project_description`
-// tool; that tool has been retired, and the project block is now
-// reachable via the general `update_settings` flow.
-const UPDATE_SETTINGS_FORBIDDEN_KEYS: ReadonlySet<string> = new Set();
-
-function patchContainsForbiddenKey(patch: unknown, forbidden: ReadonlySet<string>): string | null {
-	if (patch === null || typeof patch !== "object" || Array.isArray(patch)) return null;
-	for (const key of Object.keys(patch as Record<string, unknown>)) {
-		if (forbidden.has(key)) return key;
-		// Top-level check only by design: `deepMerge` merges nested
-		// plain-object descendants, so a deep scan would let an agent
-		// slip a "project" object past the guard anyway. Shallow is
-		// both sufficient and unambiguous.
-	}
-	return null;
-}
 
 const UpdateSettingsParams = Type.Object({
 	patch: Type.Any({ description: "Partial settings object to merge (JSON Merge Patch, RFC 7396)" }),
@@ -83,33 +65,21 @@ const updateSettingsTool = defineTool({
 	name: "update_settings",
 	label: "Update Settings",
 	description:
-		"Apply a partial update to the settings file. The patch is deep-merged into the current settings. Changes that can be live-applied take effect immediately; others set a flag and require a /reload.",
+		"Apply a partial update to settings.json. The patch is deep-merged into the current settings. Tier-1 fields (model, env, runtime) take effect immediately; tier-2 UI/advanced flags set a /reload flag.",
 	parameters: UpdateSettingsParams,
 
 	async execute(_id, params, _signal, _onUpdate, _ctx) {
-		const forbidden = patchContainsForbiddenKey(params.patch, UPDATE_SETTINGS_FORBIDDEN_KEYS);
-		if (forbidden !== null) {
-			return jsonResult({
-				ok: false,
-				error: `update_settings cannot patch "${forbidden}". Use the dedicated tool for that field.`,
-			});
-		}
 		const current = getSettings();
 		const merged = deepMerge(current, params.patch) as SettingsFile;
-		const path = getSettingsPath();
 		const nextCounter = setSettings(merged);
 		return jsonResult({
 			ok: true,
 			writtenVersion: nextCounter,
-			path,
+			path: getSettingsPath(),
 			message: "Settings updated. Some changes may require a /reload to take full effect.",
 		});
 	},
 });
-
-// ---------------------------------------------------------------------------
-// Tool 3: list_sessions
-// ---------------------------------------------------------------------------
 
 const ListSessionsParams = Type.Object({
 	project: Type.Optional(Type.String({ description: "Optional project filter" })),
@@ -120,8 +90,7 @@ const ListSessionsParams = Type.Object({
 const listSessionsTool = defineTool({
 	name: "list_sessions",
 	label: "List Sessions",
-	description:
-		"List all sessions in the current workspace, most recent first. Each entry includes id, name, created/modified timestamps, message count, token totals, cost, and file path.",
+	description: "List all sessions in the current workspace, most recent first. Reads settings.json's sessionsIndex.",
 	parameters: ListSessionsParams,
 
 	async execute(_id, params, _signal, _onUpdate, _ctx) {
@@ -129,19 +98,9 @@ const listSessionsTool = defineTool({
 		const sessions = settings.sessionsIndex?.sessions ?? [];
 		const limit = params.limit ?? 50;
 		const offset = params.offset ?? 0;
-		return jsonResult({
-			ok: true,
-			total: sessions.length,
-			limit,
-			offset,
-			sessions: sessions.slice(offset, offset + limit),
-		});
+		return jsonResult({ ok: true, total: sessions.length, limit, offset, sessions: sessions.slice(offset, offset + limit) });
 	},
 });
-
-// ---------------------------------------------------------------------------
-// Tool 4: get_session_detail
-// ---------------------------------------------------------------------------
 
 const GetSessionDetailParams = Type.Object({
 	sessionId: Type.String({ description: "The session id" }),
@@ -150,8 +109,7 @@ const GetSessionDetailParams = Type.Object({
 const getSessionDetailTool = defineTool({
 	name: "get_session_detail",
 	label: "Get Session Detail",
-	description:
-		"Return the full list of entries in a session: messages, tool calls, compactions, branch summaries, custom entries, labels. Granular detail of every event in the session.",
+	description: "Return the metadata for a session from sessionsIndex.",
 	parameters: GetSessionDetailParams,
 
 	async execute(_id, params, _signal, _onUpdate, _ctx) {
@@ -160,15 +118,9 @@ const getSessionDetailTool = defineTool({
 		if (!meta) {
 			return jsonResult({ ok: false, error: `Session not found: ${params.sessionId}` });
 		}
-		// Note: full entry streaming is handled by the LLM via `pi` actions,
-		// but the meta + path are returned so the LLM can decide.
 		return jsonResult({ ok: true, meta, note: "Full entry streaming available via the agent session itself." });
 	},
 });
-
-// ---------------------------------------------------------------------------
-// Tool 5: get_session_tree
-// ---------------------------------------------------------------------------
 
 const GetSessionTreeParams = Type.Object({
 	sessionId: Type.String({ description: "The session id" }),
@@ -188,10 +140,6 @@ const getSessionTreeTool = defineTool({
 		});
 	},
 });
-
-// ---------------------------------------------------------------------------
-// Tool 6: get_session_stats
-// ---------------------------------------------------------------------------
 
 const GetSessionStatsParams = Type.Object({
 	sessionId: Type.String({ description: "The session id" }),
@@ -213,10 +161,6 @@ const getSessionStatsTool = defineTool({
 	},
 });
 
-// ---------------------------------------------------------------------------
-// Tool 7: list_catalog
-// ---------------------------------------------------------------------------
-
 const ListCatalogParams = Type.Object({
 	type: Type.Union([Type.Literal("skill"), Type.Literal("extension"), Type.Literal("prompt")], {
 		description: "Which catalog to list",
@@ -226,8 +170,7 @@ const ListCatalogParams = Type.Object({
 const listCatalogTool = defineTool({
 	name: "list_catalog",
 	label: "List Catalog",
-	description:
-		"List all addable skills, extensions, or prompts discovered in the workspace, with their current active/inactive state. The catalog is the universe of what could be enabled.",
+	description: "List all addable skills, extensions, or prompts discovered in the workspace, with current active state.",
 	parameters: ListCatalogParams,
 
 	async execute(_id, params, _signal, _onUpdate, _ctx) {
@@ -248,56 +191,8 @@ const listCatalogTool = defineTool({
 	},
 });
 
-// ---------------------------------------------------------------------------
-// Tool 8: toggle_resource
-// ---------------------------------------------------------------------------
-
-const ToggleResourceParams = Type.Object({
-	type: Type.Union([Type.Literal("skill"), Type.Literal("extension"), Type.Literal("prompt")], {
-		description: "Resource type",
-	}),
-	path: Type.String({ description: "Path to the resource (as listed in the catalog)" }),
-	active: Type.Boolean({ description: "True to enable, false to disable" }),
-});
-
-const toggleResourceTool = defineTool({
-	name: "toggle_resource",
-	label: "Toggle Resource",
-	description:
-		"Enable or disable a skill, extension, or prompt. Adds/removes the path in the file's corresponding array. A /reload is required to bind the new resource into the running session.",
-	parameters: ToggleResourceParams,
-
-	async execute(_id, params, _signal, _onUpdate, _ctx) {
-		const settings = getSettings();
-		const arrayKey = params.type === "skill" ? "skills" : params.type === "extension" ? "extensions" : "prompts";
-		const current = (settings[arrayKey] as string[] | undefined) ?? [];
-		let next: string[];
-		if (params.active) {
-			next = current.includes(params.path) ? current : [...current, params.path];
-		} else {
-			next = current.filter((p) => p !== params.path);
-		}
-		const merged = { ...settings, [arrayKey]: next };
-		const path = getSettingsPath();
-		const nextCounter = setSettings(merged);
-		return jsonResult({
-			ok: true,
-			writtenVersion: nextCounter,
-			arrayKey,
-			active: next,
-			message: params.active
-				? `Enabled ${params.type} ${params.path}. Run /reload to bind it into the running session.`
-				: `Disabled ${params.type} ${params.path}. Run /reload to unbind it.`,
-		});
-	},
-});
-
-// ---------------------------------------------------------------------------
-// Tool 9: update_checklist
-// ---------------------------------------------------------------------------
-
 const UpdateChecklistParams = Type.Object({
-	taskName: Type.String({ description: "Short name of the task the agent is working on (e.g. 'Implement POST /orders')" }),
+	taskName: Type.String({ description: "Short name of the task" }),
 	items: Type.Array(
 		Type.Object({
 			text: Type.String({ description: "One step in the plan" }),
@@ -311,7 +206,7 @@ const updateChecklistTool = defineTool({
 	name: "update_checklist",
 	label: "Update Checklist",
 	description:
-		"Replace the agent's current task checklist. Call this whenever you start a new task (with all items `done: false`) or as you mark steps complete. The right sidebar's 'Active checklist' accordion mirrors these rows live.",
+		"Replace the agent's current task checklist. The right sidebar's 'Active checklist' accordion mirrors these rows live.",
 	parameters: UpdateChecklistParams,
 
 	async execute(_id, params, _signal, _onUpdate, _ctx) {
@@ -333,13 +228,235 @@ const updateChecklistTool = defineTool({
 });
 
 // ---------------------------------------------------------------------------
+// manage.json — get + read + write user-tweakable surface
+// ---------------------------------------------------------------------------
+
+const getCurrentManageTool = defineTool({
+	name: "get_current_manage",
+	label: "Get Current Manage",
+	description: "Return the contents of `<agentDir>/manage.json` (identity, behavior, permissions, resources, planMode, project).",
+	parameters: Type.Object({}),
+
+	async execute(_id, _params, _signal, _onUpdate, _ctx) {
+		return jsonResult({ ok: true, manage: getManage() });
+	},
+});
+
+const UpdateManageParams = Type.Object({
+	patch: Type.Any({ description: "Partial manage object to merge (JSON Merge Patch, RFC 7396)" }),
+});
+
+const updateManageTool = defineTool({
+	name: "update_manage",
+	label: "Update Manage",
+	description:
+		"Apply a partial update to manage.json. Deep-merges over the current state. Used to edit identity, behavior, permissions, planMode, project metadata.",
+	parameters: UpdateManageParams,
+
+	async execute(_id, params, _signal, _onUpdate, _ctx) {
+		const current = getManage();
+		const merged = deepMerge(current, params.patch) as ManageFile;
+		const nextCounter = setManage(merged);
+		return jsonResult({
+			ok: true,
+			writtenVersion: nextCounter,
+			path: getManagePath(),
+			message: "manage.json updated. Path or permission changes may require a /reload.",
+		});
+	},
+});
+
+const ToggleResourceParams = Type.Object({
+	type: Type.Union([Type.Literal("skill"), Type.Literal("extension"), Type.Literal("prompt")], {
+		description: "Resource type",
+	}),
+	path: Type.String({ description: "Path to the resource (as listed in the catalog)" }),
+	active: Type.Boolean({ description: "True to enable, false to disable" }),
+});
+
+const toggleResourceTool = defineTool({
+	name: "toggle_resource",
+	label: "Toggle Resource",
+	description:
+		"Enable or disable a skill, extension, or prompt. Adds/removes the path in manage.json's corresponding array. A /reload is required to bind the resource into the running session.",
+	parameters: ToggleResourceParams,
+
+	async execute(_id, params, _signal, _onUpdate, _ctx) {
+		const manage = getManage();
+		const arrayKey = params.type === "skill" ? "skills" : params.type === "extension" ? "extensions" : "prompts";
+		const current = (manage[arrayKey] as string[] | undefined) ?? [];
+		let next: string[];
+		if (params.active) {
+			next = current.includes(params.path) ? current : [...current, params.path];
+		} else {
+			next = current.filter((p) => p !== params.path);
+		}
+		const merged = { ...manage, [arrayKey]: next } as ManageFile;
+		const nextCounter = setManage(merged);
+		return jsonResult({
+			ok: true,
+			writtenVersion: nextCounter,
+			arrayKey,
+			active: next,
+			message: params.active
+				? `Enabled ${params.type} ${params.path}. Run /reload to bind it into the running session.`
+				: `Disabled ${params.type} ${params.path}. Run /reload to unbind it.`,
+		});
+	},
+});
+
+// ---------------------------------------------------------------------------
+// overview.json — get + read + write right-sidebar snapshot
+// ---------------------------------------------------------------------------
+
+const getCurrentOverviewTool = defineTool({
+	name: "get_current_overview",
+	label: "Get Current Overview",
+	description: "Return the contents of `<agentDir>/overview.json` (name, description, health, team, focus, activity).",
+	parameters: Type.Object({}),
+
+	async execute(_id, _params, _signal, _onUpdate, _ctx) {
+		return jsonResult({ ok: true, overview: getOverview() });
+	},
+});
+
+const UpdateOverviewParams = Type.Object({
+	patch: Type.Any({ description: "Partial overview object to merge (JSON Merge Patch, RFC 7396)" }),
+});
+
+const updateOverviewTool = defineTool({
+	name: "update_overview",
+	label: "Update Overview",
+	description:
+		"Apply a partial update to overview.json. The right sidebar's Overview tab reads from this file. Use it to set focus items, log activity, snapshot project health.",
+	parameters: UpdateOverviewParams,
+
+	async execute(_id, params, _signal, _onUpdate, _ctx) {
+		const current = getOverview();
+		const merged = deepMerge(current, params.patch) as OverviewFile;
+		const nextCounter = setOverview(merged);
+		return jsonResult({
+			ok: true,
+			writtenVersion: nextCounter,
+			path: getOverviewPath(),
+			message: "overview.json updated.",
+		});
+	},
+});
+
+// ---------------------------------------------------------------------------
+// inbox.json — append-only feed for notifications, permission asks, questions
+// ---------------------------------------------------------------------------
+
+const AppendInboxParams = Type.Object({
+	kind: Type.Union([Type.Literal("notification"), Type.Literal("permission"), Type.Literal("question")], {
+		description: "Inbox item type",
+	}),
+	message: Type.String({ description: "Human-readable content (one or two sentences)" }),
+	severity: Type.Optional(Type.Union([Type.Literal("info"), Type.Literal("warning"), Type.Literal("error")], {
+		description: "Severity for notifications and permission asks",
+	})),
+	payload: Type.Optional(Type.Any({ description: "Optional structured data (tool schema for permission, choices for question)" })),
+});
+
+const appendInboxTool = defineTool({
+	name: "append_inbox",
+	label: "Append Inbox Item",
+	description:
+		"Append an item to inbox.json. Use notifications for human-facing status updates, permission asks for tool approval requests, questions for clarifications the user must answer.",
+	parameters: AppendInboxParams,
+
+	async execute(_id, params, _signal, _onUpdate, _ctx) {
+		const current = getInbox();
+		const now = new Date().toISOString();
+		const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		const item: InboxItem = {
+			id,
+			kind: params.kind,
+			severity: params.severity,
+			message: params.message,
+			payload: params.payload as Record<string, unknown> | undefined,
+			status: "pending",
+			createdAt: now,
+		};
+		const next: InboxFile = {
+			...current,
+			items: [...current.items, item],
+		};
+		const nextCounter = setInbox(next);
+		return jsonResult({
+			ok: true,
+			writtenVersion: nextCounter,
+			id,
+			item,
+			message: `Appended ${params.kind} to inbox.json`,
+		});
+	},
+});
+
+const MarkInboxReadParams = Type.Object({
+	id: Type.String({ description: "Inbox item id" }),
+	answeredWith: Type.Optional(Type.Any({ description: "Optional answer payload for question items" })),
+});
+
+const markInboxReadTool = defineTool({
+	name: "mark_inbox_read",
+	label: "Mark Inbox Item Read",
+	description:
+		"Flip a pending inbox item to read (or answered if a payload was supplied). The right sidebar's Inbox tab updates live.",
+	parameters: MarkInboxReadParams,
+
+	async execute(_id, params, _signal, _onUpdate, _ctx) {
+		const current = getInbox();
+		const idx = current.items.findIndex((i) => i.id === params.id);
+		if (idx === -1) {
+			return jsonResult({ ok: false, error: `Inbox item not found: ${params.id}` });
+		}
+		const items = current.items.slice();
+		const existing = items[idx]!;
+		const updated: InboxItem = {
+			...existing,
+			status: params.answeredWith !== undefined ? "answered" : "read",
+			updatedAt: new Date().toISOString(),
+			answeredWith: params.answeredWith,
+		};
+		items[idx] = updated;
+		const next: InboxFile = { ...current, items };
+		const nextCounter = setInbox(next);
+		return jsonResult({ ok: true, writtenVersion: nextCounter, item: updated });
+	},
+});
+
+const ClearInboxParams = Type.Object({
+	status: Type.Optional(Type.Union([
+		Type.Literal("read"), Type.Literal("answered"), Type.Literal("dismissed"), Type.Literal("pending"),
+	], { description: "Only clear items in this status; omit to clear all" })),
+});
+
+const clearInboxTool = defineTool({
+	name: "clear_inbox",
+	label: "Clear Inbox",
+	description: "Drop inbox items. By default clears all; pass a status to drop only matching items.",
+	parameters: ClearInboxParams,
+
+	async execute(_id, params, _signal, _onUpdate, _ctx) {
+		const current = getInbox();
+		const before = current.items.length;
+		const items = params.status === undefined
+			? []
+			: current.items.filter((i) => i.status !== params.status);
+		const next: InboxFile = { ...current, items };
+		const nextCounter = setInbox(next);
+		return jsonResult({ ok: true, writtenVersion: nextCounter, removed: before - items.length, remaining: items.length });
+	},
+});
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/**
- * Register all 10 tools with the extension API.
- */
 export function registerAllTools(pi: ExtensionAPI): void {
+	// settings.json
 	pi.registerTool(getCurrentSettingsTool);
 	pi.registerTool(updateSettingsTool);
 	pi.registerTool(listSessionsTool);
@@ -347,12 +464,23 @@ export function registerAllTools(pi: ExtensionAPI): void {
 	pi.registerTool(getSessionTreeTool);
 	pi.registerTool(getSessionStatsTool);
 	pi.registerTool(listCatalogTool);
-	pi.registerTool(toggleResourceTool);
 	pi.registerTool(updateChecklistTool);
+
+	// manage.json
+	pi.registerTool(getCurrentManageTool);
+	pi.registerTool(updateManageTool);
+	pi.registerTool(toggleResourceTool);
+
+	// overview.json
+	pi.registerTool(getCurrentOverviewTool);
+	pi.registerTool(updateOverviewTool);
+
+	// inbox.json
+	pi.registerTool(appendInboxTool);
+	pi.registerTool(markInboxReadTool);
+	pi.registerTool(clearInboxTool);
 }
 
-// Exported for the session_shutdown teardown so the in-memory checklist
-// doesn't leak across sessions in the same agent process.
 export { clearChecklist };
 
 // ---------------------------------------------------------------------------

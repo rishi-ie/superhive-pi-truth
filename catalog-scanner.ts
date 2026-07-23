@@ -15,7 +15,7 @@
 
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import type { Catalog, CatalogEntry, SettingsFile } from "./settings-schema.ts";
+import type { Catalog, CatalogEntry, ManageFile, SettingsFile } from "./settings-schema.ts";
 
 const DEFAULT_SCAN_ROOTS = ["./skills", "./extensions", "./prompts"];
 
@@ -23,6 +23,7 @@ export interface CatalogScannerOptions {
 	workspace: string;
 	getSettings(): SettingsFile;
 	setSettings(settings: SettingsFile): void;
+	getManage(): ManageFile;
 	notify?(message: string, level?: "info" | "warning" | "error"): void;
 }
 
@@ -50,10 +51,10 @@ export function createCatalogScanner(options: CatalogScannerOptions): CatalogSca
 			const rel = relative(options.workspace, full);
 			const activeSet = new Set(
 				type === "skills"
-					? options.getSettings().skills ?? []
+					? options.getManage().skills ?? []
 					: type === "extensions"
-						? options.getSettings().extensions ?? []
-						: options.getSettings().prompts ?? [],
+						? options.getManage().extensions ?? []
+						: options.getManage().prompts ?? [],
 			);
 			const isActive = activeSet.has(rel) || activeSet.has(`./${rel}`);
 

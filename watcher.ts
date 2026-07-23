@@ -1,7 +1,7 @@
 /**
- * File watcher for the settings file.
+ * Per-file watcher for the four truth files.
  *
- * Watches the parent directory of the settings file (handles atomic-rename
+ * Watches the parent directory of the target file (handles atomic-rename
  * writes — `fs.watch` on a single file breaks after inode change). Debounces
  * events by 100ms (Node's `fs.watch` can fire multiple times per write).
  *
@@ -11,32 +11,23 @@
  * the agent's own write, not by an external change).
  *
  * Fallback: if `fs.watch` errors, switches to `fs.watchFile` polling at
- * 1s intervals (per the `fs-watch.ts` pattern in the fork).
+ * 1s intervals.
  */
 
 import { existsSync, readFileSync, watch, type FSWatcher, watchFile } from "node:fs";
-import { basename, dirname, join } from "node:path";
-import { writerCounter } from "./file-io.ts";
+import { basename, dirname } from "node:path";
 
 export interface WatcherOptions {
-	/** Debounce window in ms (default 100) */
 	debounceMs?: number;
-	/** Called whenever a meaningful change is detected. */
 	onChange: () => void;
-	/** Called on watcher errors (for diagnostics). */
 	onError?: (error: Error) => void;
 }
 
 export interface Watcher {
-	/** Start watching. Idempotent. */
 	start(): void;
-	/** Stop watching. Idempotent. */
 	stop(): void;
-	/** Update the last-seen writer counter. Use after an agent-initiated write. */
 	markSelfWrite(): void;
-	/** Return the current last-seen writer counter. */
 	lastSeen(): number;
-	/** True if the watcher is currently running. */
 	running(): boolean;
 }
 
@@ -54,29 +45,32 @@ export function createWatcher(targetPath: string, options: WatcherOptions): Watc
 	let running = false;
 	let stopped = false;
 
+	function readCounter(): number {
+		if (!existsSync(targetPath)) return 0;
+		try {
+			const raw = readFileSync(targetPath, "utf-8");
+			const parsed = JSON.parse(raw) as { managedBy?: string };
+			const tag = parsed.managedBy ?? "";
+			const match = /#(\d+)$/.exec(tag);
+			if (!match || !match[1]) return 0;
+			return Number.parseInt(match[1], 10);
+		} catch {
+			return 0;
+		}
+	}
+
 	function fire() {
 		if (stopped) return;
 		try {
 			if (!existsSync(targetPath)) {
-				// File was deleted; treat as a change (caller will seed defaults)
 				options.onChange();
 				return;
 			}
-			const raw = readFileSync(targetPath, "utf-8");
-			let counter = 0;
-			try {
-				const parsed = JSON.parse(raw);
-				counter = writerCounter(parsed);
-			} catch {
-				// Partial read mid-write; treat as change and let caller re-validate
-				options.onChange();
-				return;
-			}
+			const counter = readCounter();
 			if (counter > lastSeenCounter) {
 				lastSeenCounter = counter;
 				options.onChange();
 			}
-			// else: this was the agent's own write — skip
 		} catch (error) {
 			options.onError?.(error as Error);
 		}
@@ -97,7 +91,6 @@ export function createWatcher(targetPath: string, options: WatcherOptions): Watc
 					debouncedFire();
 					return;
 				}
-				// Fire on any event that touches our target file or a rename
 				if (filename === targetBasename || filename.startsWith(`${targetBasename}.`)) {
 					debouncedFire();
 				}
@@ -139,17 +132,8 @@ export function createWatcher(targetPath: string, options: WatcherOptions): Watc
 		}
 	}
 
-	// Seed the last-seen counter from the current file (if any) so the first
-	// read after the agent writes the file doesn't trigger a self-applied diff.
 	function seedCounter() {
-		if (!existsSync(targetPath)) return;
-		try {
-			const raw = readFileSync(targetPath, "utf-8");
-			const parsed = JSON.parse(raw);
-			lastSeenCounter = writerCounter(parsed);
-		} catch {
-			// ignore
-		}
+		lastSeenCounter = readCounter();
 	}
 
 	return {
@@ -171,9 +155,7 @@ export function createWatcher(targetPath: string, options: WatcherOptions): Watc
 			}
 		},
 		markSelfWrite() {
-			// After the agent writes, bump the counter so the next watcher
-			// fire is treated as a self-write.
-			lastSeenCounter = lastSeenCounter + 1;
+			lastSeenCounter = readCounter();
 		},
 		lastSeen() {
 			return lastSeenCounter;
@@ -182,14 +164,4 @@ export function createWatcher(targetPath: string, options: WatcherOptions): Watc
 			return running;
 		},
 	};
-}
-
-/**
- * Convenience helper: derive the file path one level up given a workspace,
- * matching the convention used everywhere else in this extension.
- */
-export function settingsFilePath(workspace: string): string {
-	const agentRoot = dirname(workspace);
-	const folder = basename(agentRoot);
-	return join(agentRoot, `Superhive-pi-${folder}.json`);
 }

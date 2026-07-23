@@ -1,28 +1,31 @@
 /**
- * Settings file schema for superhive-pi-truth.
+ * Per-agent truth split.
  *
- * The file `Superhive-pi-{foldername}.json` is the single source of truth for
- * all Pi agent configuration after the first launch. It is a superset of:
+ * Every agent directory carries four sibling JSON files, each owned by
+ * superhive-pi-truth:
  *
- * - The boot-time `Manifest` schema (skills, extensions, prompts, model,
- *   environment, permissions, workspace, system prompt)
- * - The runtime `Settings` interface (theme, compaction, retry, UI flags,
- *   providers, keybindings, telemetry, etc.)
- * - Live runtime state (current thinking level, active tools, current session)
- * - The catalog of addable skills/extensions/prompts
- * - A sessions index for external readers (Superhive, RPC consumers)
- * - A small live event tail
+ *   settings.json    runtime essentials: model, env, providers, runtime,
+ *                    systemPrompt, tier-2 UI flags, advanced, truth-internal
+ *                    bookkeeping (catalog, sessionsIndex, lastEvent, checklist)
+ *   manage.json      user-tweakable surface: identity, behavior, permissions,
+ *                    skills/extensions/prompts/packages/themes, planMode,
+ *                    project (coordinator-only)
+ *   overview.json    right-sidebar Overview snapshot: name + description
+ *                    mirrored from manage.json's project block, plus
+ *                    coordinator-authored health/team/focus/activity
+ *   inbox.json       append-only feed: notifications, permission asks,
+ *                    agent questions
  *
- * The schema is zero-dep (no TypeBox) so the extension can be dropped into
- * a clone without an `npm install` step. The validator does shallow
- * structural checks; the migration step deep-merges over defaults so new
- * fields are populated automatically.
+ * telemetry.jsonl is unchanged (append-only event stream, separate concern).
+ *
+ * Each of the four files has its own `managedBy` counter
+ * (`superhive-pi-truth@1#N`) and atomic `tmp + rename` write. The schemas
+ * are zero-dep (no TypeBox) so the extension can be vendored into a clone
+ * without an `npm install` step.
  */
 
-import nodePath from "node:path";
-
 // ---------------------------------------------------------------------------
-// Type definitions
+// Shared primitives
 // ---------------------------------------------------------------------------
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -32,44 +35,6 @@ export type ProjectTrust = "ask" | "always" | "never";
 export type DoubleEscapeAction = "fork" | "tree" | "none";
 export type TreeFilterMode = "default" | "no-tools" | "user-only" | "labeled-only" | "all";
 export type OutputPad = 0 | 1;
-
-// ---------------------------------------------------------------------------
-// Plan mode (superhive-pi-plan extension)
-//
-// The plan-mode extension reads `planMode` from this file on every
-// session_start and before_agent_start. The extension is Tier-3 — truth
-// stores it but does not apply it. The `defaultMode` field controls the
-// chat-composer dropdown semantics:
-//
-//   "plan"  — force plan mode on at session_start
-//   "build" — force plan mode off; `/plan` is blocked
-//   "auto"  — upstream default; user toggles via /plan
-//
-// Cross-module rule: the canonical schema lives here. The Electron side
-// mirrors this shape in `superhive/electron/agent-settings-defaults.ts`.
-// Any change here must be mirrored in that file before commit.
-// ---------------------------------------------------------------------------
-
-export type PlanDefaultMode = "plan" | "build" | "auto";
-export type PlanThinkingLevel =
-	| "inherit"
-	| "off"
-	| "minimal"
-	| "low"
-	| "medium"
-	| "high"
-	| "xhigh"
-	| "max";
-
-export interface PlanModeSettings {
-	defaultMode: PlanDefaultMode;
-	thinkingLevel: PlanThinkingLevel;
-	defaultPlanTools?: string[];
-	safeSubcommands?: {
-		git?: string[];
-		gh?: string[];
-	};
-}
 
 export interface ModelRef {
 	provider: string;
@@ -82,8 +47,81 @@ export interface Permissions {
 	network?: boolean;
 }
 
-export interface Logging {
-	enabled?: boolean;
+export interface ProviderEntry {
+	name?: string;
+	baseUrl?: string | null;
+	apiKey?: string;
+}
+
+export interface PackageSourceObject {
+	source: string;
+	extensions?: string[];
+	skills?: string[];
+	prompts?: string[];
+	themes?: string[];
+}
+
+export type PackageSource = string | PackageSourceObject;
+
+export interface CatalogEntry {
+	path: string;
+	size?: number;
+	active: boolean;
+}
+
+export interface Catalog {
+	lastScanned?: string;
+	scanRoots?: string[];
+	skills?: CatalogEntry[];
+	extensions?: CatalogEntry[];
+	prompts?: CatalogEntry[];
+}
+
+export interface SessionIndexEntry {
+	id: string;
+	name?: string;
+	created: string;
+	modified: string;
+	messageCount: number;
+	tokens: {
+		input: number;
+		output: number;
+		total: number;
+		cacheRead?: number;
+		cacheWrite?: number;
+	};
+	cost: number;
+	path: string;
+}
+
+export interface SessionsIndex {
+	lastUpdated?: string;
+	sessions: SessionIndexEntry[];
+}
+
+export interface ChecklistItem {
+	text: string;
+	done: boolean;
+}
+
+export interface ChecklistState {
+	taskName: string;
+	items: ChecklistItem[];
+	lastUpdated?: string;
+}
+
+export interface Runtime {
+	thinkingLevel?: ThinkingLevel;
+	activeTools?: string[];
+	currentSessionId?: string;
+	lastReloadedAt?: string;
+}
+
+export interface LastEvent {
+	type: string;
+	sessionId?: string;
+	entryId?: string;
+	timestamp: string;
 }
 
 export interface CompactionSettings {
@@ -137,82 +175,35 @@ export interface WarningSettings {
 	anthropicExtraUsage?: boolean;
 }
 
-export interface PackageSourceObject {
-	source: string;
-	extensions?: string[];
-	skills?: string[];
-	prompts?: string[];
-	themes?: string[];
-}
+// ---------------------------------------------------------------------------
+// Plan mode (superhive-pi-plan extension)
+// ---------------------------------------------------------------------------
 
-export type PackageSource = string | PackageSourceObject;
+export type PlanDefaultMode = "plan" | "build" | "auto";
+export type PlanThinkingLevel =
+	| "inherit"
+	| "off"
+	| "minimal"
+	| "low"
+	| "medium"
+	| "high"
+	| "xhigh"
+	| "max";
 
-export interface ProviderEntry {
-	name?: string;
-	baseUrl?: string | null;
-	apiKey?: string;
-}
-
-export interface CatalogEntry {
-	path: string;
-	size?: number;
-	active: boolean;
-}
-
-export interface Catalog {
-	lastScanned?: string;
-	scanRoots?: string[];
-	skills?: CatalogEntry[];
-	extensions?: CatalogEntry[];
-	prompts?: CatalogEntry[];
-}
-
-export interface SessionIndexEntry {
-	id: string;
-	name?: string;
-	created: string;
-	modified: string;
-	messageCount: number;
-	tokens: {
-		input: number;
-		output: number;
-		total: number;
-		cacheRead?: number;
-		cacheWrite?: number;
+export interface PlanModeSettings {
+	defaultMode: PlanDefaultMode;
+	thinkingLevel: PlanThinkingLevel;
+	defaultPlanTools?: string[];
+	safeSubcommands?: {
+		git?: string[];
+		gh?: string[];
 	};
-	cost: number;
-	path: string;
 }
 
-export interface SessionsIndex {
-	lastUpdated?: string;
-	sessions: SessionIndexEntry[];
-}
+// ---------------------------------------------------------------------------
+// Project block (manage.json, coordinator-only)
+// ---------------------------------------------------------------------------
 
-export interface Runtime {
-	thinkingLevel?: ThinkingLevel;
-	activeTools?: string[];
-	currentSessionId?: string;
-	lastReloadedAt?: string;
-}
-
-export interface LastEvent {
-	type: string;
-	sessionId?: string;
-	entryId?: string;
-	timestamp: string;
-}
-
-/**
- * A member agent reference as stored on the coordinator's `project` block.
- * Mirrors the runtime Agent row but is a snapshot for the LLM context —
- * `status` is kept fresh by Electron's status-mirror helper on
- * start/stop/update_status transitions.
- *
- * `localPath` (Gap 2) lets the coordinator's `ask_member` tool resolve the
- * recipient agent's directory to write `<memberDir>/inbox.jsonl` without an
- * out-of-band index. Electron stamps it on member-add.
- */
 export interface MemberRef {
 	agentId: string;
 	name: string;
@@ -223,17 +214,6 @@ export interface MemberRef {
 	localPath?: string;
 }
 
-/**
- * Project block embedded in the coordinator's truth settings file.
- * Only present when `agentKind === 'project-coordinator'`. The orchestration
- * extension (`superhive-pi-orchestration`) reads this on `session_start` to
- * build the CEO system prompt and to power the 5 coordinator-only tools.
- *
- * Gap 2: `localPath` lets worker agents' `post_to_project` tool find
- * `<localPath>/agent/chat.jsonl` to append to the project chat. `coordinatorAgentId`
- * was implicit before; now explicit so the orchestrator extension can detect
- * role by comparison with `AGENT_ID`.
- */
 export interface ProjectBlock {
 	id: string;
 	name: string;
@@ -243,51 +223,31 @@ export interface ProjectBlock {
 	coordinatorAgentId?: string;
 }
 
+// ---------------------------------------------------------------------------
+// settings.json
+// ---------------------------------------------------------------------------
+
 export interface SettingsFile {
 	version: 1;
 	managedBy?: string;
 	lastModified?: string;
 
-	// Agent identity
-	name?: string;
-	description?: string;
-	workspace?: string;
-
 	// LLM
 	model?: ModelRef;
-	systemPrompt?: string;
 	defaultProvider?: string;
 	defaultModel?: string;
 	defaultThinkingLevel?: ThinkingLevel;
 	enabledModels?: string[];
+	systemPrompt?: string;
 
-	// Resources
-	skills?: string[];
-	extensions?: string[];
-	prompts?: string[];
-	packages?: PackageSource[];
-	themes?: string[];
-
-	// Environment + permissions
+	// Environment + providers
 	environment?: Record<string, string>;
-	permissions?: Permissions;
-
-	// Providers (auth + custom)
 	providers?: Record<string, ProviderEntry>;
 
-	// Tools
-	activeTools?: string[];
+	// Live runtime state
+	runtime?: Runtime;
 
-	// Behavior
-	steeringMode?: SteeringMode;
-	followUpMode?: SteeringMode;
-	autoCompaction?: boolean;
-	autoRetry?: boolean;
-	compaction?: CompactionSettings;
-	branchSummary?: BranchSummarySettings;
-	retry?: RetrySettings;
-
-	// UI
+	// Tier-2 UI flags
 	theme?: string;
 	hideThinkingBlock?: boolean;
 	quietStartup?: boolean;
@@ -320,32 +280,150 @@ export interface SettingsFile {
 	images?: ImageSettings;
 	thinkingBudgets?: ThinkingBudgets;
 
-	// Manifest leftovers (cosmetic / future)
-	memory?: Record<string, unknown>;
-	context?: Record<string, unknown>;
-	logging?: Logging;
-
-	// Live runtime state
-	runtime?: Runtime;
-
-	// Catalog (extension writes, external reads)
+	// Truth-internal bookkeeping (extension writes, external reads)
 	catalog?: Catalog;
-
-	// Sessions index (extension writes, external reads)
 	sessionsIndex?: SessionsIndex;
-
-	// Last event (small ring buffer)
+	checklist?: ChecklistState;
 	lastEvent?: LastEvent;
+}
 
-	// Project metadata (coordinator-only). Written by Electron on coordinator
-	// creation; kept fresh by the status-mirror helper on member start/stop.
-	// Read by the orchestration extension's session_start handler.
-	project?: ProjectBlock;
+// ---------------------------------------------------------------------------
+// manage.json
+// ---------------------------------------------------------------------------
 
-	// Plan mode (coordinator-only). Read by the superhive-pi-plan extension
-	// on session_start and before_agent_start. Tier-3 — truth stores it
-	// but does not apply it. See `PlanModeSettings` for field semantics.
+export interface IdentityBlock {
+	name?: string;
+	description?: string;
+	workspace?: string;
+}
+
+export interface BehaviorBlock {
+	steeringMode?: SteeringMode;
+	followUpMode?: SteeringMode;
+	autoCompaction?: boolean;
+	autoRetry?: boolean;
+	compaction?: CompactionSettings;
+	branchSummary?: BranchSummarySettings;
+	retry?: RetrySettings;
+}
+
+export interface ManageFile {
+	version: 1;
+	managedBy?: string;
+	lastModified?: string;
+
+	identity?: IdentityBlock;
+	permissions?: Permissions;
+	behavior?: BehaviorBlock;
+
+	skills?: string[];
+	extensions?: string[];
+	prompts?: string[];
+	packages?: PackageSource[];
+	themes?: string[];
+
 	planMode?: PlanModeSettings;
+	project?: ProjectBlock;
+}
+
+// ---------------------------------------------------------------------------
+// overview.json (right-sidebar Overview snapshot)
+// ---------------------------------------------------------------------------
+
+export interface OverviewHealth {
+	status: "healthy" | "attention" | "blocked";
+	agents: number;
+	active: number;
+	idle: number;
+	tasks: number;
+	completed: number;
+	waiting: number;
+	lastUpdated: string;
+}
+
+export interface OverviewMemberCard {
+	id: string;
+	name: string;
+	status: "idle" | "active" | "busy" | "waiting" | "error";
+	work: string;
+}
+
+export interface OverviewActivityItem {
+	id: string;
+	time: string;
+	text: string;
+}
+
+export interface OverviewFile {
+	version: 1;
+	managedBy?: string;
+	lastModified?: string;
+
+	// Mirrored from manage.json's project block on every update_manage.
+	name: string;
+	description: string;
+
+	health?: OverviewHealth;
+	team?: OverviewMemberCard[];
+	focus?: string[];
+	activity?: OverviewActivityItem[];
+}
+
+// ---------------------------------------------------------------------------
+// inbox.json (append-only feed)
+// ---------------------------------------------------------------------------
+
+export type InboxItemKind = "notification" | "permission" | "question";
+export type InboxItemStatus = "pending" | "read" | "answered" | "dismissed";
+export type InboxItemSeverity = "info" | "warning" | "error";
+
+export interface InboxItem {
+	id: string;
+	kind: InboxItemKind;
+	severity?: InboxItemSeverity;
+	message: string;
+	/** Optional structured payload (tool schema for permission asks, choices for questions). */
+	payload?: Record<string, unknown>;
+	status: InboxItemStatus;
+	createdAt: string;
+	updatedAt?: string;
+	answeredWith?: unknown;
+}
+
+export interface InboxFile {
+	version: 1;
+	managedBy?: string;
+	lastModified?: string;
+	items: InboxItem[];
+}
+
+// ---------------------------------------------------------------------------
+// Path helpers
+// ---------------------------------------------------------------------------
+
+import nodePath from "node:path";
+
+export interface TruthPaths {
+	settings: string;
+	manage: string;
+	overview: string;
+	inbox: string;
+	legacy: string;
+}
+
+/**
+ * Resolve the four truth file paths plus the legacy
+ * `Superhive-pi-{foldername}.json` for a given agent directory.
+ */
+export function truthPathsForAgentDir(agentDir: string): TruthPaths {
+	const folder = nodePath.basename(agentDir);
+	return {
+		settings: nodePath.join(agentDir, "settings.json"),
+		manage: nodePath.join(agentDir, "manage.json"),
+		overview: nodePath.join(agentDir, "overview.json"),
+		inbox: nodePath.join(agentDir, "inbox.json"),
+		legacy: nodePath.join(agentDir, `Superhive-pi-${folder}.json`),
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -355,31 +433,15 @@ export interface SettingsFile {
 export const DEFAULT_SETTINGS: SettingsFile = {
 	version: 1,
 	managedBy: "superhive-pi-truth@1",
-	name: "",
-	description: "",
-	workspace: "./workspace",
 	model: { provider: "", name: "" },
-	systemPrompt: "",
 	defaultProvider: "",
 	defaultModel: "",
 	defaultThinkingLevel: "medium",
 	enabledModels: [],
-	skills: [],
-	extensions: [],
-	prompts: [],
-	packages: [],
-	themes: [],
+	systemPrompt: "",
 	environment: {},
-	permissions: { filesystem: true, terminal: true, network: true },
 	providers: {},
-	activeTools: [],
-	steeringMode: "all",
-	followUpMode: "all",
-	autoCompaction: true,
-	autoRetry: true,
-	compaction: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
-	branchSummary: { reserveTokens: 16384, skipPrompt: false },
-	retry: { enabled: true, maxRetries: 3, baseDelayMs: 2000 },
+	runtime: { thinkingLevel: "medium", activeTools: [] },
 	theme: "",
 	hideThinkingBlock: false,
 	quietStartup: false,
@@ -408,77 +470,278 @@ export const DEFAULT_SETTINGS: SettingsFile = {
 	terminal: { showImages: true, imageWidthCells: 60, clearOnShrink: false, showTerminalProgress: false },
 	images: { autoResize: true, blockImages: false },
 	thinkingBudgets: { minimal: 0, low: 1024, medium: 4096, high: 16384 },
-	memory: {},
-	context: {},
-	logging: { enabled: true },
-	runtime: { thinkingLevel: "medium", activeTools: [] },
 	catalog: { lastScanned: "", scanRoots: [], skills: [], extensions: [], prompts: [] },
 	sessionsIndex: { lastUpdated: "", sessions: [] },
+};
+
+export const DEFAULT_MANAGE: ManageFile = {
+	version: 1,
+	managedBy: "superhive-pi-truth@1",
+	identity: { name: "", description: "", workspace: "./workspace" },
+	permissions: { filesystem: true, terminal: true, network: true },
+	behavior: {
+		steeringMode: "all",
+		followUpMode: "all",
+		autoCompaction: true,
+		autoRetry: true,
+		compaction: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
+		branchSummary: { reserveTokens: 16384, skipPrompt: false },
+		retry: { enabled: true, maxRetries: 3, baseDelayMs: 2000 },
+	},
+	skills: [],
+	extensions: [],
+	prompts: [],
+	packages: [],
+	themes: [],
 	planMode: { defaultMode: "auto", thinkingLevel: "inherit" },
 };
 
-// ---------------------------------------------------------------------------
-// Path helper
-// ---------------------------------------------------------------------------
+export const DEFAULT_OVERVIEW: OverviewFile = {
+	version: 1,
+	managedBy: "superhive-pi-truth@1",
+	name: "",
+	description: "",
+	team: [],
+	focus: [],
+	activity: [],
+};
 
-/**
- * Resolve the settings file path for a given workspace.
- *
- * The file lives one level up from the workspace (at the agent root), named
- * `Superhive-pi-{foldername}.json` where {foldername} is the basename of the
- * agent root.
- *
- *   /path/my-agent/workspace  ->  /path/my-agent/Superhive-pi-my-agent.json
- *   /path/agent/workspace     ->  /path/agent/Superhive-pi-agent.json
- */
-export function settingsFilePathFor(workspace: string): string {
-	const agentRoot = nodePath.dirname(workspace);
-	const folder = nodePath.basename(agentRoot);
-	return nodePath.join(agentRoot, `Superhive-pi-${folder}.json`);
-}
+export const DEFAULT_INBOX: InboxFile = {
+	version: 1,
+	managedBy: "superhive-pi-truth@1",
+	items: [],
+};
 
 // ---------------------------------------------------------------------------
-// Migration + validation
+// Validation + per-file normalize
 // ---------------------------------------------------------------------------
 
-/**
- * Migrate a raw settings object to the current version and merge over
- * defaults. Throws on a future-version file.
- */
-export function migrateToCurrent(raw: Record<string, unknown>): SettingsFile {
-	const version = typeof raw.version === "number" ? raw.version : 0;
-	if (version > 1) {
-		throw new Error(
-			`Settings file version ${version} is newer than this extension supports. Upgrade superhive-pi-truth.`,
-		);
-	}
-	return deepMerge(structuredClone(DEFAULT_SETTINGS), raw) as SettingsFile;
-}
+const VERSION = 1 as const;
 
-/**
- * Validate a settings object. Returns the normalized SettingsFile on success;
- * throws a path-tagged error on failure.
- */
-export function validateSettings(raw: unknown): SettingsFile {
+export function validateAndNormalizeSettings(raw: unknown): SettingsFile {
 	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-		throw new Error("Settings file must be a JSON object");
+		throw new Error("settings.json must be a JSON object");
 	}
 	const obj = raw as Record<string, unknown>;
-	if (!("version" in obj)) {
-		throw new Error("Settings file missing required field: version");
-	}
 	if (typeof obj.version !== "number") {
-		throw new Error(`Settings file version must be a number, got ${typeof obj.version}`);
+		throw new Error("settings.json missing required field: version");
 	}
-	if (obj.version > 1) {
-		throw new Error(
-			`Settings file version ${obj.version} is newer than this extension supports. Upgrade superhive-pi-truth.`,
-		);
+	if (obj.version > VERSION) {
+		throw new Error(`settings.json version ${obj.version} is newer than this extension supports. Upgrade superhive-pi-truth.`);
 	}
-	if (obj.version < 1) {
-		throw new Error(`Settings file version must be 1, got ${obj.version}`);
+	if (obj.version < VERSION) {
+		throw new Error(`settings.json version must be ${VERSION}, got ${obj.version}`);
 	}
-	return migrateToCurrent(obj);
+	return deepMerge(structuredClone(DEFAULT_SETTINGS), obj) as SettingsFile;
+}
+
+export function validateAndNormalizeManage(raw: unknown): ManageFile {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+		throw new Error("manage.json must be a JSON object");
+	}
+	const obj = raw as Record<string, unknown>;
+	if (typeof obj.version !== "number") {
+		throw new Error("manage.json missing required field: version");
+	}
+	if (obj.version > VERSION) {
+		throw new Error(`manage.json version ${obj.version} is newer than this extension supports. Upgrade superhive-pi-truth.`);
+	}
+	if (obj.version < VERSION) {
+		throw new Error(`manage.json version must be ${VERSION}, got ${obj.version}`);
+	}
+	return deepMerge(structuredClone(DEFAULT_MANAGE), obj) as ManageFile;
+}
+
+export function validateAndNormalizeOverview(raw: unknown): OverviewFile {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+		throw new Error("overview.json must be a JSON object");
+	}
+	const obj = raw as Record<string, unknown>;
+	if (typeof obj.version !== "number") {
+		throw new Error("overview.json missing required field: version");
+	}
+	if (obj.version > VERSION) {
+		throw new Error(`overview.json version ${obj.version} is newer than this extension supports. Upgrade superhive-pi-truth.`);
+	}
+	if (obj.version < VERSION) {
+		throw new Error(`overview.json version must be ${VERSION}, got ${obj.version}`);
+	}
+	return deepMerge(structuredClone(DEFAULT_OVERVIEW), obj) as OverviewFile;
+}
+
+export function validateAndNormalizeInbox(raw: unknown): InboxFile {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+		throw new Error("inbox.json must be a JSON object");
+	}
+	const obj = raw as Record<string, unknown>;
+	if (typeof obj.version !== "number") {
+		throw new Error("inbox.json missing required field: version");
+	}
+	if (obj.version > VERSION) {
+		throw new Error(`inbox.json version ${obj.version} is newer than this extension supports. Upgrade superhive-pi-truth.`);
+	}
+	if (obj.version < VERSION) {
+		throw new Error(`inbox.json version must be ${VERSION}, got ${obj.version}`);
+	}
+	const merged = deepMerge(structuredClone(DEFAULT_INBOX), obj) as InboxFile;
+	if (!Array.isArray(merged.items)) {
+		throw new Error("inbox.json items must be an array");
+	}
+	return merged;
+}
+
+// ---------------------------------------------------------------------------
+// Counter helpers
+// ---------------------------------------------------------------------------
+
+const COUNTER_RE = /#(\d+)$/;
+
+/**
+ * Extract the writer counter from a `managedBy` string like
+ * "superhive-pi-truth@1#5". Returns 0 if not set.
+ */
+export function writerCounter(managedBy: string | undefined | null): number {
+	if (!managedBy) return 0;
+	const match = COUNTER_RE.exec(managedBy);
+	if (!match || !match[1]) return 0;
+	return Number.parseInt(match[1], 10);
+}
+
+/**
+ * Build the next counter string for a given file prefix.
+ */
+export function nextManagedBy(
+	prevManagedBy: string | undefined,
+	tag = "superhive-pi-truth@1",
+): string {
+	const next = writerCounter(prevManagedBy) + 1;
+	return `${tag}#${next}`;
+}
+
+// ---------------------------------------------------------------------------
+// Serialization
+// ---------------------------------------------------------------------------
+
+export function serializeTruthFile<T>(file: T): string {
+	return `${JSON.stringify(file, null, "\t")}\n`;
+}
+
+// ---------------------------------------------------------------------------
+// Legacy migrator
+// ---------------------------------------------------------------------------
+
+/**
+ * Split a legacy `Superhive-pi-{foldername}.json` blob into the four new
+ * truth shapes. Used once per agent, on first launch after the split.
+ *
+ * Caller is responsible for writing each file (with its own counter) and
+ * deleting the legacy file.
+ */
+export interface MigratedTruth {
+	settings: SettingsFile;
+	manage: ManageFile;
+	overview: OverviewFile;
+	inbox: InboxFile;
+}
+
+export function migrateLegacyToFour(raw: Record<string, unknown>): MigratedTruth {
+	// Build a deep-cloned legacy base, then strip fields that belong in
+	// each new file so deepMerge doesn't shadow them.
+	const settingsRaw = deepStrip({ ...raw }, [
+		"name", "description", "workspace",
+		"permissions",
+		"skills", "extensions", "prompts", "packages", "themes",
+		"steeringMode", "followUpMode", "autoCompaction", "autoRetry", "compaction", "branchSummary", "retry",
+		"planMode",
+		"project",
+		"managedBy", "lastModified", "version", // re-stamped on each new file
+	]) as Record<string, unknown>;
+	const manageRaw = deepStrip({ ...raw }, [
+		"model", "defaultProvider", "defaultModel", "defaultThinkingLevel", "enabledModels",
+		"systemPrompt", "environment", "providers", "runtime",
+		"theme", "hideThinkingBlock", "quietStartup", "doubleEscapeAction", "treeFilterMode",
+		"showHardwareCursor", "editorPaddingX", "outputPad", "autocompleteMaxVisible",
+		"markdown", "warnings",
+		"defaultProjectTrust", "collapseChangelog", "enableInstallTelemetry", "enableAnalytics",
+		"trackingId", "enableSkillCommands", "shellPath", "shellCommandPrefix",
+		"npmCommand", "externalEditor", "transport", "sessionDir", "httpProxy",
+		"httpIdleTimeoutMs", "websocketConnectTimeoutMs", "terminal", "images", "thinkingBudgets",
+		"catalog", "sessionsIndex", "lastEvent", "checklist",
+		"managedBy", "lastModified", "version",
+	]) as Record<string, unknown>;
+
+	// settings.json — strip the bookkeeping and merge over defaults.
+	const settingsMerged = deepMerge(structuredClone(DEFAULT_SETTINGS), settingsRaw) as SettingsFile;
+	// Catalog/sessionsIndex/lastEvent preserved from raw.
+
+	// manage.json — keep identity-name/desc/workspace, permissions, skills etc, behavior, planMode, project.
+	const manageMerged = deepMerge(structuredClone(DEFAULT_MANAGE), manageRaw) as ManageFile;
+	// identity block: read from top-level legacy keys if not nested.
+	if (!manageRaw.identity) {
+		manageMerged.identity = {
+			name: typeof raw.name === "string" ? raw.name : "",
+			description: typeof raw.description === "string" ? raw.description : "",
+			workspace: typeof raw.workspace === "string" ? raw.workspace : "./workspace",
+		};
+	}
+	// behavior block: top-level legacy fields populate if not nested.
+	if (!manageRaw.behavior) {
+		const b: BehaviorBlock = {};
+		if (raw.steeringMode !== undefined) b.steeringMode = raw.steeringMode as SteeringMode;
+		if (raw.followUpMode !== undefined) b.followUpMode = raw.followUpMode as SteeringMode;
+		if (raw.autoCompaction !== undefined) b.autoCompaction = raw.autoCompaction as boolean;
+		if (raw.autoRetry !== undefined) b.autoRetry = raw.autoRetry as boolean;
+		if (raw.compaction !== undefined) b.compaction = raw.compaction as CompactionSettings;
+		if (raw.branchSummary !== undefined) b.branchSummary = raw.branchSummary as BranchSummarySettings;
+		if (raw.retry !== undefined) b.retry = raw.retry as RetrySettings;
+		manageMerged.behavior = b;
+	}
+	// skills / extensions / prompts at top level were the legacy array — copy in.
+	if (!manageRaw.skills && Array.isArray(raw.skills)) manageMerged.skills = raw.skills as string[];
+	if (!manageRaw.extensions && Array.isArray(raw.extensions)) manageMerged.extensions = raw.extensions as string[];
+	if (!manageRaw.prompts && Array.isArray(raw.prompts)) manageMerged.prompts = raw.prompts as string[];
+	if (!manageRaw.packages && Array.isArray(raw.packages)) manageMerged.packages = raw.packages as PackageSource[];
+	if (!manageRaw.themes && Array.isArray(raw.themes)) manageMerged.themes = raw.themes as string[];
+
+	// overview.json — start with mirrored name/description from the project block,
+	// or fall back to identity.
+	const overview: OverviewFile = {
+		...structuredClone(DEFAULT_OVERVIEW),
+		name: typeof raw.name === "string" ? raw.name : "",
+		description: "",
+	};
+	const project = (raw.project ?? null) as { name?: unknown; description?: unknown } | null;
+	if (project && typeof project.name === "string") overview.name = project.name;
+	if (project && typeof project.description === "string") overview.description = project.description;
+	if (!overview.description && typeof raw.description === "string") {
+		overview.description = raw.description;
+	}
+
+	const inbox: InboxFile = {
+		...structuredClone(DEFAULT_INBOX),
+		items: [],
+	};
+
+	// Reset version + managed counters; the writer stamps them.
+	settingsMerged.version = VERSION;
+	settingsMerged.managedBy = "superhive-pi-truth@1";
+	manageMerged.version = VERSION;
+	manageMerged.managedBy = "superhive-pi-truth@1";
+	overview.version = VERSION;
+	overview.managedBy = "superhive-pi-truth@1";
+	inbox.version = VERSION;
+	inbox.managedBy = "superhive-pi-truth@1";
+
+	return { settings: settingsMerged, manage: manageMerged, overview, inbox };
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+function deepStrip<T extends Record<string, unknown>>(obj: T, keys: string[]): T {
+	for (const k of keys) delete obj[k];
+	return obj;
 }
 
 function deepMerge<T>(base: T, overrides: unknown): T {
@@ -506,15 +769,4 @@ function deepMerge<T>(base: T, overrides: unknown): T {
 		}
 	}
 	return result as T;
-}
-
-// ---------------------------------------------------------------------------
-// Serialization
-// ---------------------------------------------------------------------------
-
-/**
- * Stable JSON serialization with tabs + trailing newline.
- */
-export function serializeSettings(settings: SettingsFile): string {
-	return `${JSON.stringify(settings, null, "\t")}\n`;
 }
