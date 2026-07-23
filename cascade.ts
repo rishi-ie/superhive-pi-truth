@@ -17,20 +17,25 @@ import { existsSync } from "node:fs";
 import {
 	DEFAULT_ORCH_EXTENSION,
 	DEFAULT_PLAN_EXTENSION,
+	DEFAULT_SPAWN_EXTENSION,
 	orchestrationExtensionPathFor,
 	planExtensionPathFor,
+	spawnExtensionPathFor,
 	truthPathsForAgentDir,
 	type ManageFile,
 	type OrchExtensionFile,
 	type PlanExtensionFile,
+	type SpawnExtensionFile,
 } from "./settings-schema.ts";
 import {
 	readManage,
 	readOrchestrationExtension,
 	readPlanExtension,
+	readSpawnExtension,
 	writeOrchestrationExtension,
 	writePlanExtension,
 	writeSettings,
+	writeSpawnExtension,
 } from "./file-io.ts";
 
 const CASCADE_DEBOUNCE_MS = 30;
@@ -69,6 +74,14 @@ export async function cascadeManageToExtensions(agentDir: string): Promise<void>
 	if (manage.project) {
 		await cascadeProjectIntoOrchFile(agentDir, manage);
 	}
+
+	// spawn ext: manage.extensions[] gain/lose superhive-pi-spawn →
+	// create or disable <agentDir>/superhive-pi-spawn.json. The
+	// ext is project-coordinator-only; we run the cascade for
+	// every agent (the spawn ext's own gate enforces project
+	// membership at tool-call time) so the file is in place when
+	// the project-coordinator toggle is on.
+	await cascadeSpawnExtensionFromManage(agentDir, manage);
 }
 
 /**
@@ -179,3 +192,75 @@ function deepEqualManaged(a: unknown, b: unknown): boolean {
 export const CASCADE_CONFIG = {
 	debounceMs: CASCADE_DEBOUNCE_MS,
 };
+
+/**
+ * OUT-cascade: project manage.extensions[] into the per-spawn file.
+ *
+ * Phase E: when the user toggles `superhive-pi-spawn` on in the
+ * Manage tab, manage.extensions[] gains the entry. The cascade
+ * creates <agentDir>/superhive-pi-spawn.json with
+ * DEFAULT_SPAWN_EXTENSION (enabled: true, allow-all, no approval).
+ *
+ * When the user toggles it OFF, manage.extensions[] loses the
+ * entry. The cascade sets enabled: false in the file, but
+ * preserves the user's `allowedTemplates` + `requireApproval`
+ * overrides so the next toggle-on restores their config.
+ *
+ * Idempotent: if the file is already in the desired state, no
+ * write happens (no counter bump). Deep-merges the user's
+ * existing sub-settings so a toggle-off → toggle-on → toggle-off
+ * cycle preserves the user's allowedTemplates.
+ */
+async function cascadeSpawnExtensionFromManage(
+	agentDir: string,
+	manage: ManageFile,
+): Promise<void> {
+	const spawnPath = spawnExtensionPathFor(agentDir);
+	const extLoaded = isSpawnExtInExtensions(manage.extensions);
+	const existing = readSpawnExtension(spawnPath);
+	const base: SpawnExtensionFile = existing ?? structuredClone(DEFAULT_SPAWN_EXTENSION);
+
+	let next: SpawnExtensionFile;
+
+	if (extLoaded) {
+		// Toggle on (or already on): the user wants this ext
+		// available. Preserve their sub-settings (allowedTemplates,
+		// requireApproval); only flip enabled to true if it was
+		// false. If a file was missing and they're enabling for
+		// the first time, write DEFAULT_SPAWN_EXTENSION as-is.
+		if (existing && existing.enabled === true) {
+			return; // no change
+		}
+		next = {
+			...base,
+			enabled: true,
+		};
+	} else {
+		// Toggle off: disable the ext but keep the user's config
+		// (allowedTemplates + requireApproval) so a future
+		// toggle-on restores it. If there's no file at all, no-op
+		// (nothing to disable).
+		if (!existing) {
+			return;
+		}
+		if (existing.enabled === false) {
+			return; // no change
+		}
+		next = {
+			...base,
+			enabled: false,
+		};
+	}
+
+	writeSpawnExtension(spawnPath, next);
+}
+
+function isSpawnExtInExtensions(extensions: ManageFile["extensions"]): boolean {
+	if (!Array.isArray(extensions)) return false;
+	return extensions.some((e) => {
+		if (typeof e !== "string") return false;
+		// Match either the bare name (UI toggle) or the
+		// ./extensions/ prefixed form (manifest convention)
+		return e === "superhive-pi-spawn" || e === "./extensions/superhive-pi-spawn";
+	});
+}
